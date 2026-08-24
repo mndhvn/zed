@@ -1,13 +1,16 @@
 use acp_thread::{
-    AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentConnection, AgentSessionClientUserMessageIds, AgentSessionInfo, AgentSessionList,
+    AgentSessionListRequest, AgentSessionListResponse, AgentSessionTruncate,
+    AgentSessionTruncateResponse, ClientUserMessageId, ElicitationStore,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{self as acp, ErrorCode},
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder, UntypedMessage,
+};
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
@@ -403,6 +406,7 @@ pub struct AcpConnection {
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    history_edit_method: Option<Arc<str>>,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
@@ -794,6 +798,23 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
         .meta(meta)
 }
 
+fn history_edit_method(meta: Option<&acp::Meta>) -> Option<Arc<str>> {
+    let history_editing = meta?
+        .get("codex")?
+        .as_object()?
+        .get("historyEditing")?
+        .as_object()?;
+    if history_editing
+        .get("clientUserMessageIds")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let method = history_editing.get("method")?.as_str()?;
+    method.starts_with('_').then(|| Arc::from(method))
+}
+
 impl AcpConnection {
     pub fn subscribe_debug_messages(
         &self,
@@ -1034,6 +1055,7 @@ impl AcpConnection {
         });
 
         let agent_info = response.agent_info;
+        let history_edit_method = history_edit_method(response.meta.as_ref());
         let telemetry_id = agent_info
             .as_ref()
             // Use the one the agent provides if we have one
@@ -1100,6 +1122,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
             agent_capabilities: response.agent_capabilities,
+            history_edit_method,
             request_elicitations,
             defaults,
             session_list,
@@ -1142,6 +1165,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            history_edit_method: None,
             request_elicitations,
             defaults,
             child: None,
@@ -1530,6 +1554,138 @@ impl Drop for AcpConnection {
         if let Some(ref mut child) = self.child {
             child.kill().log_err();
         }
+    }
+}
+
+fn send_prompt(
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    params: acp::PromptRequest,
+    cx: &mut App,
+) -> Task<Result<acp::PromptResponse>> {
+    let session_id = params.session_id.clone();
+    cx.foreground_executor().spawn(async move {
+        let result = connection.send_request(params).block_task().await;
+
+        let mut suppress_abort_err = false;
+        if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
+            suppress_abort_err = session.suppress_abort_err;
+            session.suppress_abort_err = false;
+        }
+
+        match result {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                if err.code == acp::ErrorCode::AuthRequired {
+                    return Err(anyhow!(acp::Error::auth_required()));
+                }
+                if err.code != ErrorCode::InternalError {
+                    anyhow::bail!(err)
+                }
+
+                let Some(data) = &err.data else {
+                    anyhow::bail!(err)
+                };
+
+                // Temporary workaround until the following PR is generally available:
+                // https://github.com/google-gemini/gemini-cli/pull/6656
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ErrorDetails {
+                    details: Box<str>,
+                }
+
+                match serde_json::from_value(data.clone()) {
+                    Ok(ErrorDetails { details }) => {
+                        if suppress_abort_err
+                            && (details.contains("This operation was aborted")
+                                || details.contains("The user aborted a request"))
+                        {
+                            Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                        } else {
+                            Err(anyhow!(details))
+                        }
+                    }
+                    Err(_) => Err(anyhow!(err)),
+                }
+            }
+        }
+    })
+}
+
+struct AcpClientUserMessageIds {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+}
+
+impl AgentSessionClientUserMessageIds for AcpClientUserMessageIds {
+    fn prompt(
+        &self,
+        client_user_message_id: ClientUserMessageId,
+        mut params: acp::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        let meta = params.meta.get_or_insert_default();
+        let codex = meta.entry("codex").or_insert_with(|| serde_json::json!({}));
+        if !codex.is_object() {
+            *codex = serde_json::json!({});
+        }
+        codex.as_object_mut().unwrap().insert(
+            "clientUserMessageId".into(),
+            client_user_message_id.as_str().into(),
+        );
+
+        send_prompt(self.connection.clone(), self.sessions.clone(), params, cx)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkEditResponse {
+    session_id: acp::SessionId,
+}
+
+struct AcpSessionForkEdit {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    session_id: acp::SessionId,
+    method: Arc<str>,
+}
+
+impl AgentSessionTruncate for AcpSessionForkEdit {
+    fn run(
+        &self,
+        client_user_message_id: ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<AgentSessionTruncateResponse>> {
+        let request = match UntypedMessage::new(
+            self.method.as_ref(),
+            serde_json::json!({
+            "sessionId": self.session_id,
+            "clientUserMessageId": client_user_message_id.as_str(),
+            }),
+        ) {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(error.into())),
+        };
+        let connection = self.connection.clone();
+        let sessions = self.sessions.clone();
+        let old_session_id = self.session_id.clone();
+
+        cx.foreground_executor().spawn(async move {
+            let response = connection.send_request(request).block_task().await?;
+            let response: ForkEditResponse = serde_json::from_value(response)?;
+
+            let mut sessions = sessions.borrow_mut();
+            let session = sessions
+                .remove(&old_session_id)
+                .context("ACP session disappeared while forking edited history")?;
+            sessions.insert(response.session_id.clone(), session);
+
+            Ok(AgentSessionTruncateResponse {
+                session_id: Some(response.session_id),
+            })
+        })
     }
 }
 
@@ -1935,6 +2091,18 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.auth.logout.is_some()
     }
 
+    fn client_user_message_ids(
+        &self,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionClientUserMessageIds>> {
+        self.history_edit_method.as_ref().map(|_| {
+            Rc::new(AcpClientUserMessageIds {
+                connection: self.connection.clone(),
+                sessions: self.sessions.clone(),
+            }) as _
+        })
+    }
+
     fn logout(&self, cx: &mut App) -> Task<Result<()>> {
         if !self.supports_logout() {
             return Task::ready(Err(anyhow!("Logout is not supported by this agent.")));
@@ -1954,59 +2122,7 @@ impl AgentConnection for AcpConnection {
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
-        let conn = self.connection.clone();
-        let sessions = self.sessions.clone();
-        let session_id = params.session_id.clone();
-        cx.foreground_executor().spawn(async move {
-            let result = conn.send_request(params).block_task().await;
-
-            let mut suppress_abort_err = false;
-
-            if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
-                suppress_abort_err = session.suppress_abort_err;
-                session.suppress_abort_err = false;
-            }
-
-            match result {
-                Ok(response) => Ok(response),
-                Err(err) => {
-                    if err.code == acp::ErrorCode::AuthRequired {
-                        return Err(anyhow!(acp::Error::auth_required()));
-                    }
-
-                    if err.code != ErrorCode::InternalError {
-                        anyhow::bail!(err)
-                    }
-
-                    let Some(data) = &err.data else {
-                        anyhow::bail!(err)
-                    };
-
-                    // Temporary workaround until the following PR is generally available:
-                    // https://github.com/google-gemini/gemini-cli/pull/6656
-
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct ErrorDetails {
-                        details: Box<str>,
-                    }
-
-                    match serde_json::from_value(data.clone()) {
-                        Ok(ErrorDetails { details }) => {
-                            if suppress_abort_err
-                                && (details.contains("This operation was aborted")
-                                    || details.contains("The user aborted a request"))
-                            {
-                                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
-                            } else {
-                                Err(anyhow!(details))
-                            }
-                        }
-                        Err(_) => Err(anyhow!(err)),
-                    }
-                }
-            }
-        })
+        send_prompt(self.connection.clone(), self.sessions.clone(), params, cx)
     }
 
     fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
@@ -2019,6 +2135,21 @@ impl AgentConnection for AcpConnection {
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
         Some(self.request_elicitations.clone())
+    }
+
+    fn truncate(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionTruncate>> {
+        self.history_edit_method.as_ref().map(|method| {
+            Rc::new(AcpSessionForkEdit {
+                connection: self.connection.clone(),
+                sessions: self.sessions.clone(),
+                session_id: session_id.clone(),
+                method: method.clone(),
+            }) as _
+        })
     }
 
     fn session_modes(
@@ -2715,6 +2846,49 @@ mod tests {
             cx.set_global(settings_store);
             cx.update_flags(false, vec![]);
         });
+    }
+
+    #[test]
+    fn parses_codex_history_edit_capability() {
+        let meta = acp::Meta::from_iter([(
+            "codex".into(),
+            serde_json::json!({
+                "historyEditing": {
+                    "clientUserMessageIds": true,
+                    "method": "_session/fork_edit"
+                }
+            }),
+        )]);
+
+        assert_eq!(
+            history_edit_method(Some(&meta)).as_deref(),
+            Some("_session/fork_edit")
+        );
+    }
+
+    #[test]
+    fn rejects_unadvertised_or_non_extension_history_edit_methods() {
+        let disabled = acp::Meta::from_iter([(
+            "codex".into(),
+            serde_json::json!({
+                "historyEditing": {
+                    "clientUserMessageIds": false,
+                    "method": "_session/fork_edit"
+                }
+            }),
+        )]);
+        let invalid_method = acp::Meta::from_iter([(
+            "codex".into(),
+            serde_json::json!({
+                "historyEditing": {
+                    "clientUserMessageIds": true,
+                    "method": "session/fork_edit"
+                }
+            }),
+        )]);
+
+        assert!(history_edit_method(Some(&disabled)).is_none());
+        assert!(history_edit_method(Some(&invalid_method)).is_none());
     }
 
     #[gpui::test]
