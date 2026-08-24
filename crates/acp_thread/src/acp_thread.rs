@@ -392,6 +392,14 @@ fn can_merge_message_chunks(
     }
 }
 
+fn client_user_message_id_from_meta(meta: Option<&acp::Meta>) -> Option<ClientUserMessageId> {
+    meta.and_then(|meta| meta.get("codex"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|codex| codex.get("clientUserMessageId"))
+        .and_then(serde_json::Value::as_str)
+        .map(|id| ClientUserMessageId::from_agent(id.to_owned()))
+}
+
 #[derive(Debug)]
 pub enum AgentThreadEntry {
     UserMessage(UserMessage),
@@ -2186,6 +2194,10 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    SessionIdChanged {
+        old_session_id: acp::SessionId,
+        new_session_id: acp::SessionId,
+    },
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -2599,8 +2611,10 @@ impl AcpThread {
             acp::SessionUpdate::UserMessageChunk(acp::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
+                let client_id = client_user_message_id_from_meta(meta.as_ref());
                 // We optimistically add the full user prompt before calling `prompt`.
                 // Some ACP servers echo user chunks back over updates. Skip echoed
                 // chunks only when they match the local optimistic message.
@@ -2621,10 +2635,13 @@ impl AcpThread {
                         if already_in_user_message && message.protocol_id.is_none() {
                             message.protocol_id = message_id.clone();
                         }
+                        if already_in_user_message && message.client_id.is_none() {
+                            message.client_id = client_id.clone();
+                        }
                         already_in_user_message
                     });
                 if !already_in_user_message {
-                    self.push_user_content_block_from_agent(message_id, content, cx);
+                    self.push_user_content_block_from_agent(client_id, message_id, content, cx);
                 }
             }
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
@@ -2726,11 +2743,12 @@ impl AcpThread {
 
     fn push_user_content_block_from_agent(
         &mut self,
+        client_id: Option<ClientUserMessageId>,
         id: Option<acp::MessageId>,
         chunk: acp::ContentBlock,
         cx: &mut Context<Self>,
     ) {
-        self.push_user_content_block_with_protocol_id(None, false, id, chunk, false, cx)
+        self.push_user_content_block_with_protocol_id(client_id, false, id, chunk, false, cx)
     }
 
     fn push_user_content_block_with_protocol_id(
@@ -4125,8 +4143,15 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         let telemetry = ActionLogTelemetry::from(&*self);
         cx.spawn(async move |this, cx| {
-            cx.update(|cx| truncate.run(client_id.clone(), cx)).await?;
+            let response = cx.update(|cx| truncate.run(client_id.clone(), cx)).await?;
             this.update(cx, |this, cx| {
+                if let Some(new_session_id) = response.session_id {
+                    let old_session_id = mem::replace(&mut this.session_id, new_session_id.clone());
+                    cx.emit(AcpThreadEvent::SessionIdChanged {
+                        old_session_id,
+                        new_session_id,
+                    });
+                }
                 if let Some((ix, _)) = this.user_message_mut(&client_id) {
                     // Collect all terminals from entries that will be removed
                     let terminals_to_remove: Vec<acp::TerminalId> = this.entries[ix..]
@@ -5714,6 +5739,49 @@ mod tests {
                     .map(ToString::to_string)
                     .as_deref(),
                 Some("msg_user_3")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_user_message_chunk_accepts_codex_client_message_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("Historical prompt".into())
+                            .message_id("protocol-message")
+                            .meta(acp::Meta::from_iter([(
+                                "codex".into(),
+                                json!({"clientUserMessageId": "codex-user-item"}),
+                            )])),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let AgentThreadEntry::UserMessage(message) = &thread.entries()[0] else {
+                panic!("expected a user message")
+            };
+            assert_eq!(
+                message.client_id.as_ref().map(ClientUserMessageId::as_str),
+                Some("codex-user-item")
             );
         });
     }
@@ -9035,8 +9103,8 @@ mod tests {
             &self,
             _client_user_message_id: ClientUserMessageId,
             _cx: &mut App,
-        ) -> Task<Result<()>> {
-            Task::ready(Ok(()))
+        ) -> Task<Result<AgentSessionTruncateResponse>> {
+            Task::ready(Ok(AgentSessionTruncateResponse::default()))
         }
     }
 

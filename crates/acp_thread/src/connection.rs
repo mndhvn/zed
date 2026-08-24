@@ -21,6 +21,14 @@ impl ClientUserMessageId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string().into())
     }
+
+    pub fn from_agent(id: impl Into<SharedString>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -265,8 +273,17 @@ impl dyn AgentConnection {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AgentSessionTruncateResponse {
+    pub session_id: Option<acp::SessionId>,
+}
+
 pub trait AgentSessionTruncate {
-    fn run(&self, client_user_message_id: ClientUserMessageId, cx: &mut App) -> Task<Result<()>>;
+    fn run(
+        &self,
+        client_user_message_id: ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<AgentSessionTruncateResponse>>;
 }
 
 pub trait AgentSessionClientUserMessageIds {
@@ -1084,8 +1101,12 @@ mod test_support {
     struct StubAgentSessionEditor;
 
     impl AgentSessionTruncate for StubAgentSessionEditor {
-        fn run(&self, _: ClientUserMessageId, _: &mut App) -> Task<Result<()>> {
-            Task::ready(Ok(()))
+        fn run(
+            &self,
+            _: ClientUserMessageId,
+            _: &mut App,
+        ) -> Task<Result<AgentSessionTruncateResponse>> {
+            Task::ready(Ok(AgentSessionTruncateResponse::default()))
         }
     }
 
