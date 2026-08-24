@@ -3045,7 +3045,7 @@ impl acp_thread::AgentSessionTruncate for NativeAgentSessionTruncate {
         &self,
         client_user_message_id: acp_thread::ClientUserMessageId,
         cx: &mut App,
-    ) -> Task<Result<()>> {
+    ) -> Task<Result<acp_thread::AgentSessionTruncateResponse>> {
         match self.thread.update(cx, |thread, cx| {
             thread.truncate(client_user_message_id.clone(), cx)?;
             Ok(thread.latest_token_usage())
@@ -3056,7 +3056,7 @@ impl acp_thread::AgentSessionTruncate for NativeAgentSessionTruncate {
                         thread.update_token_usage(usage, cx);
                     })
                     .ok();
-                Task::ready(Ok(()))
+                Task::ready(Ok(acp_thread::AgentSessionTruncateResponse::default()))
             }
             Err(error) => Task::ready(Err(error)),
         }

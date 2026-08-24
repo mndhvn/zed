@@ -287,9 +287,9 @@ impl Conversation {
     pub fn register_thread(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
         let session_id = thread.read(cx).session_id().clone();
         let subscription = cx.subscribe(&thread, {
-            let session_id = session_id.clone();
-            move |this, _thread, event, _cx| {
+            move |this, thread, event, cx| {
                 this.updated_at = Some(Instant::now());
+                let session_id = thread.read(cx).session_id().clone();
                 match event {
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
                         this.permission_requests
@@ -317,6 +317,26 @@ impl Conversation {
                             if elicitations.is_empty() {
                                 this.elicitation_requests.shift_remove(&session_id);
                             }
+                        }
+                    }
+                    AcpThreadEvent::SessionIdChanged {
+                        old_session_id,
+                        new_session_id,
+                    } => {
+                        if let Some(thread) = this.threads.remove(old_session_id) {
+                            this.threads.insert(new_session_id.clone(), thread);
+                        }
+                        if let Some(requests) =
+                            this.permission_requests.shift_remove(old_session_id)
+                        {
+                            this.permission_requests
+                                .insert(new_session_id.clone(), requests);
+                        }
+                        if let Some(requests) =
+                            this.elicitation_requests.shift_remove(old_session_id)
+                        {
+                            this.elicitation_requests
+                                .insert(new_session_id.clone(), requests);
                         }
                     }
                     AcpThreadEvent::NewEntry
@@ -590,6 +610,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
+        | AcpThreadEvent::SessionIdChanged { .. }
         | AcpThreadEvent::PromptUpdated => false,
     }
 }
@@ -1582,6 +1603,32 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let AcpThreadEvent::SessionIdChanged {
+            old_session_id,
+            new_session_id,
+        } = event
+        {
+            if let Some(connected) = self.as_connected_mut()
+                && let Some(thread_view) = connected.threads.remove(old_session_id)
+            {
+                thread_view.update(cx, |thread_view, _cx| {
+                    thread_view.session_id = new_session_id.clone();
+                });
+                connected
+                    .threads
+                    .insert(new_session_id.clone(), thread_view);
+                if connected.active_id.as_ref() == Some(old_session_id) {
+                    connected.active_id = Some(new_session_id.clone());
+                }
+            }
+            if self.root_session_id.as_ref() == Some(old_session_id) {
+                self.root_session_id = Some(new_session_id.clone());
+            }
+            cx.emit(RootThreadUpdated);
+            cx.notify();
+            return;
+        }
+
         let session_id = thread.read(cx).session_id().clone();
         let has_thread = self
             .as_connected()
@@ -1872,6 +1919,7 @@ impl ConversationView {
                 }
                 cx.notify();
             }
+            AcpThreadEvent::SessionIdChanged { .. } => unreachable!(),
         }
         cx.notify();
     }
