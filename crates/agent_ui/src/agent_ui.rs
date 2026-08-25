@@ -281,6 +281,8 @@ actions!(
         ResetFastModeWarnings,
         /// Opens the "Add Context" menu in the message editor.
         OpenAddContextMenu,
+        /// Starts or stops OpenAI voice dictation in the message editor.
+        ToggleVoiceDictation,
         /// Interrupts the current generation and sends the message immediately.
         SendImmediately,
         /// Sends the next queued message immediately.

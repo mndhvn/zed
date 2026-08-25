@@ -375,6 +375,13 @@
     },
   },
   {
+    "context": "AcpThread > MessageEditor > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-g": "agent::ToggleVoiceDictation",
+    },
+  },
+  {
     "context": "AcpThread > Editor && start_of_input",
     "use_key_equivalents": true,
     "bindings": {
