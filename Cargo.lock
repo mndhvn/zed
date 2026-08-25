@@ -517,6 +517,7 @@ dependencies = [
  "menu",
  "multi_buffer",
  "notifications",
+ "open_ai",
  "ordered-float 2.10.1",
  "parking_lot",
  "paths",
@@ -561,6 +562,7 @@ dependencies = [
  "watch",
  "workspace",
  "zed_actions",
+ "zed_credentials_provider",
 ]
 
 [[package]]

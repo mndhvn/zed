@@ -617,6 +617,12 @@ pub struct ThreadView {
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
     _sandbox_status_refresh_task: Option<Task<()>>,
+    #[cfg(feature = "audio")]
+    voice_recording: Option<audio::MicrophoneRecording>,
+    #[cfg(feature = "audio")]
+    voice_transcription_in_progress: bool,
+    #[cfg(feature = "audio")]
+    _voice_transcription_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
     pub in_flight_prompt: Option<Vec<acp::ContentBlock>>,
     pub _subscriptions: Vec<Subscription>,
@@ -1031,6 +1037,12 @@ impl ThreadView {
             _save_task: None,
             _draft_resolve_task: None,
             _sandbox_status_refresh_task: None,
+            #[cfg(feature = "audio")]
+            voice_recording: None,
+            #[cfg(feature = "audio")]
+            voice_transcription_in_progress: false,
+            #[cfg(feature = "audio")]
+            _voice_transcription_task: None,
             hovered_edited_file_buttons: None,
             in_flight_prompt: None,
             message_editor,
@@ -4449,6 +4461,7 @@ impl ThreadView {
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
                                     })
+                                    .children(self.render_voice_transcription_button(cx))
                                     .child(self.render_send_button(cx)),
                             ),
                     ),
@@ -5471,6 +5484,170 @@ impl ThreadView {
                 }))
                 .into_any_element()
         }
+    }
+
+    fn render_voice_transcription_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        #[cfg(not(feature = "audio"))]
+        {
+            let _ = cx;
+            None
+        }
+
+        #[cfg(feature = "audio")]
+        {
+            if self.voice_transcription_in_progress {
+                return Some(
+                    div()
+                        .id("voice-transcription-in-progress")
+                        .px_1()
+                        .tooltip(Tooltip::text("Transcribing…"))
+                        .child(loading_contents_spinner(IconSize::default()))
+                        .into_any_element(),
+                );
+            }
+
+            let is_recording = self.voice_recording.is_some();
+            let button = IconButton::new(
+                "voice-transcription",
+                if is_recording {
+                    IconName::Stop
+                } else {
+                    IconName::Mic
+                },
+            )
+            .icon_size(IconSize::Small)
+            .when(is_recording, |button| {
+                button
+                    .icon_color(Color::Error)
+                    .style(ButtonStyle::Tinted(TintColor::Error))
+            })
+            .when(!is_recording, |button| button.icon_color(Color::Muted))
+            .tooltip(Tooltip::text(if is_recording {
+                "Stop and Transcribe"
+            } else {
+                "Dictate with OpenAI"
+            }))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_voice_transcription(window, cx);
+            }));
+
+            Some(button.into_any_element())
+        }
+    }
+
+    #[cfg(feature = "audio")]
+    fn toggle_voice_transcription(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.voice_transcription_in_progress {
+            return;
+        }
+
+        let Some(recording) = self.voice_recording.take() else {
+            let input_device = audio::AudioSettings::get_global(cx)
+                .input_audio_device
+                .clone();
+            match audio::MicrophoneRecording::start(input_device) {
+                Ok(recording) => {
+                    self._voice_transcription_task = None;
+                    self.voice_recording = Some(recording);
+                    cx.notify();
+                }
+                Err(error) => {
+                    self.show_voice_transcription_error(
+                        format!("Could not start microphone: {error}"),
+                        cx,
+                    );
+                }
+            }
+            return;
+        };
+
+        self.voice_transcription_in_progress = true;
+        cx.notify();
+
+        let finish_recording = cx.background_spawn(async move { recording.finish() });
+        let credentials_provider = zed_credentials_provider::global(cx);
+        let http_client = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).app_state().client.http_client());
+        let environment_api_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty());
+
+        self._voice_transcription_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<String> = async {
+                let recording = finish_recording.await?;
+                let http_client = http_client
+                    .ok_or_else(|| anyhow::anyhow!("workspace closed before transcription"))?;
+                let api_key = if let Some(api_key) = environment_api_key {
+                    api_key
+                } else {
+                    let credentials = credentials_provider
+                        .read_credentials(open_ai::OPEN_AI_API_URL, cx)
+                        .await?;
+                    let Some((_username, api_key)) = credentials else {
+                        anyhow::bail!(
+                            "Add an OpenAI API key in Settings > AI > LLM Providers > OpenAI"
+                        );
+                    };
+                    String::from_utf8(api_key).map_err(|_| {
+                        anyhow::anyhow!("The stored OpenAI API key is not valid UTF-8")
+                    })?
+                };
+
+                open_ai::transcription::transcribe_wav(
+                    http_client.as_ref(),
+                    open_ai::OPEN_AI_API_URL,
+                    &api_key,
+                    recording.wav_bytes,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+            }
+            .await;
+
+            this.update_in(cx, |this, window, cx| {
+                this.voice_transcription_in_progress = false;
+                match result {
+                    Ok(text) if !text.trim().is_empty() => {
+                        this.message_editor.update(cx, |editor, cx| {
+                            editor.insert_text(text.trim(), window, cx);
+                        });
+                    }
+                    Ok(_) => this.show_voice_transcription_error("No speech was detected", cx),
+                    Err(error) => {
+                        log::error!("OpenAI voice transcription failed: {error:#}");
+                        this.show_voice_transcription_error(
+                            format!("Voice transcription failed: {error}"),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    #[cfg(feature = "audio")]
+    fn show_voice_transcription_error(
+        &self,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(message, cx, |this, _cx| {
+                this.icon(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
+                )
+            });
+            workspace.toggle_status_toast(toast, cx);
+        });
     }
 
     fn render_add_context_button(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
