@@ -1,6 +1,7 @@
 pub mod batches;
 pub mod completion;
 pub mod responses;
+pub mod transcription;
 
 #[cfg(test)]
 mod chat_completion_transport_tests;
