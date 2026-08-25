@@ -40226,12 +40226,18 @@ fn test_open_results_in_action_argument_parsing() {
         Some(OpenResultsIn::MultiBuffer),
     );
 
-    // The argument coexists with `FindAllReferences`'s existing field, which
-    // keeps its own default when only `open_results_in` is provided.
+    // Find All References defaults to the compact picker, while still allowing
+    // keybindings to opt back into the multibuffer results page.
+    let default_references = serde_json::from_value::<FindAllReferences>(json!({})).unwrap();
+    assert_eq!(
+        default_references.open_results_in,
+        Some(OpenResultsIn::Picker)
+    );
+
     let references =
-        serde_json::from_value::<FindAllReferences>(json!({ "open_results_in": "picker" }))
+        serde_json::from_value::<FindAllReferences>(json!({ "open_results_in": "multi_buffer" }))
             .unwrap();
-    assert_eq!(references.open_results_in, Some(OpenResultsIn::Picker));
+    assert_eq!(references.open_results_in, Some(OpenResultsIn::MultiBuffer));
     assert!(references.always_open_multibuffer);
 }
 
