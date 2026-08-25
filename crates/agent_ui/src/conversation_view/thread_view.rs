@@ -5522,16 +5522,32 @@ impl ThreadView {
                     .style(ButtonStyle::Tinted(TintColor::Error))
             })
             .when(!is_recording, |button| button.icon_color(Color::Muted))
-            .tooltip(Tooltip::text(if is_recording {
-                "Stop and Transcribe"
-            } else {
-                "Dictate with OpenAI"
-            }))
+            .tooltip(move |_, cx| {
+                Tooltip::for_action(
+                    if is_recording {
+                        "Stop and Transcribe"
+                    } else {
+                        "Dictate with OpenAI"
+                    },
+                    &ToggleVoiceDictation,
+                    cx,
+                )
+            })
             .on_click(cx.listener(|this, _, window, cx| {
-                this.toggle_voice_transcription(window, cx);
+                this.toggle_voice_dictation(window, cx);
             }));
 
             Some(button.into_any_element())
+        }
+    }
+
+    fn toggle_voice_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "audio")]
+        self.toggle_voice_transcription(window, cx);
+
+        #[cfg(not(feature = "audio"))]
+        {
+            let _ = (window, cx);
         }
     }
 
@@ -12446,6 +12462,9 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
             .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(|this, _: &ToggleVoiceDictation, window, cx| {
+                this.toggle_voice_dictation(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);
             }))
