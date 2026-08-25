@@ -8278,7 +8278,7 @@ impl Editor {
             return Some(Task::ready(Ok(())));
         }
 
-        let workspace = self.workspace()?.downgrade();
+        let multi_buffer = self.buffer.clone();
         let (buffer, start) = self
             .buffer
             .read(cx)
@@ -8291,8 +8291,6 @@ impl Editor {
             return None;
         }
 
-        let old_name = rename.old_name;
-
         let rename = self.semantics_provider.as_ref()?.perform_rename(
             &buffer,
             start,
@@ -8303,14 +8301,11 @@ impl Editor {
 
         Some(cx.spawn_in(window, async move |editor, cx| {
             let project_transaction = rename.await?;
-            Self::open_project_transaction(
-                &editor,
-                workspace,
-                project_transaction,
-                format!("Rename: {} → {}", old_name, new_name),
-                cx,
-            )
-            .await?;
+            multi_buffer.update(cx, |multi_buffer, cx| {
+                if !multi_buffer.is_singleton() {
+                    multi_buffer.push_transaction(&project_transaction.0, cx);
+                }
+            });
 
             editor.update(cx, |editor, cx| {
                 editor.refresh_document_highlights(cx);

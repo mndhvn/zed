@@ -1016,17 +1016,21 @@ pub struct GoToTypeDefinition {
 pub struct FindAllReferences {
     #[serde(default = "default_true")]
     pub always_open_multibuffer: bool,
-    /// Where to show the references. Falls back to the `lsp_results_location`
-    /// setting when omitted. A single result is always opened directly.
-    #[serde(default)]
+    /// Where to show the references. Defaults to the picker when omitted. A
+    /// single result is always opened directly.
+    #[serde(default = "default_find_all_references_results_location")]
     pub open_results_in: Option<OpenResultsIn>,
+}
+
+fn default_find_all_references_results_location() -> Option<OpenResultsIn> {
+    Some(OpenResultsIn::Picker)
 }
 
 impl Default for FindAllReferences {
     fn default() -> Self {
         Self {
             always_open_multibuffer: true,
-            open_results_in: None,
+            open_results_in: default_find_all_references_results_location(),
         }
     }
 }
