@@ -1858,6 +1858,33 @@ impl PickerDelegate for FileFinderDelegate {
         cx.notify();
     }
 
+    fn selected_index_changed(
+        &self,
+        ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<Box<dyn Fn(&mut Window, &mut App) + 'static>> {
+        let path_match = self.matches.get(ix)?.clone();
+        if matches!(&path_match, Match::Channel { .. } | Match::CreateNew(_)) {
+            return None;
+        }
+
+        let picker = cx.entity().downgrade();
+        Some(Box::new(move |window, cx| {
+            let picker = picker.clone();
+            let path_match = path_match.clone();
+            window.defer(cx, move |window, cx| {
+                picker
+                    .update(cx, |picker, cx| {
+                        picker
+                            .delegate
+                            .open_match(path_match, false, false, true, window, cx);
+                    })
+                    .log_err();
+            });
+        }))
+    }
+
     fn separators_after_indices(&self) -> Vec<usize> {
         if self.separate_history {
             let first_non_history_index = self
