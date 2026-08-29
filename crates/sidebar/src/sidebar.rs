@@ -5638,16 +5638,8 @@ impl Sidebar {
         }
     }
 
-    fn archive_selected_thread(
-        &mut self,
-        _: &ArchiveSelectedThread,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(ix) = self.selection else {
-            return;
-        };
-        match self.contents.entries.get(ix) {
+    fn archive_entry_at_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match self.contents.entries.get(ix).cloned() {
             Some(ListEntry::Thread(thread)) => {
                 match thread.status {
                     AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation => {
@@ -5672,6 +5664,27 @@ impl Sidebar {
         }
     }
 
+    fn archive_selected_thread(
+        &mut self,
+        _: &ArchiveSelectedThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.selection else {
+            return;
+        };
+        self.archive_entry_at_index(ix, window, cx);
+    }
+
+    fn rename_thread_at_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ListEntry::Thread(thread)) = self.contents.entries.get(ix).cloned() else {
+            return;
+        };
+        let thread_id = thread.metadata.thread_id;
+        let title = thread.metadata.display_title();
+        self.start_renaming_thread(ix, thread_id, title, window, cx);
+    }
+
     fn rename_selected_thread(
         &mut self,
         _: &RenameSelectedThread,
@@ -5681,12 +5694,29 @@ impl Sidebar {
         let Some(ix) = self.selection else {
             return;
         };
-        let Some(ListEntry::Thread(thread)) = self.contents.entries.get(ix) else {
+        self.rename_thread_at_index(ix, window, cx);
+    }
+
+    fn active_thread_index(&self) -> Option<usize> {
+        let active = self.active_entry.as_ref()?;
+        self.contents
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, ListEntry::Thread(_)) && active.matches_entry(entry))
+    }
+
+    fn rename_active_thread_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_thread_index() else {
             return;
         };
-        let thread_id = thread.metadata.thread_id;
-        let title = thread.metadata.display_title();
-        self.start_renaming_thread(ix, thread_id, title, window, cx);
+        self.rename_thread_at_index(ix, window, cx);
+    }
+
+    fn archive_active_thread_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_thread_index() else {
+            return;
+        };
+        self.archive_entry_at_index(ix, window, cx);
     }
 
     fn record_thread_access(&mut self, id: &ThreadId) {
@@ -7139,6 +7169,48 @@ impl Sidebar {
         }
     }
 
+    fn activate_thread_at_index_impl(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Thread(thread) => Some(thread.clone()),
+                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+            })
+            .nth(index)
+        else {
+            return;
+        };
+
+        let metadata = thread.metadata.clone();
+        match &thread.workspace {
+            ThreadEntryWorkspace::Open(workspace) => {
+                let workspace = workspace.clone();
+                self.activate_thread(metadata, &workspace, true, window, cx);
+            }
+            ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            } => {
+                let folder_paths = folder_paths.clone();
+                let project_group_key = project_group_key.clone();
+                self.open_workspace_and_activate_thread(
+                    metadata,
+                    folder_paths,
+                    &project_group_key,
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
     fn on_next_thread(&mut self, _: &NextThread, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_thread_impl(true, window, cx);
     }
@@ -7720,6 +7792,23 @@ impl WorkspaceSidebar for Sidebar {
 
     fn cycle_thread(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_thread_impl(forward, window, cx);
+    }
+
+    fn activate_thread_at_index(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_thread_at_index_impl(index, window, cx);
+    }
+
+    fn rename_active_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_active_thread_impl(window, cx);
+    }
+
+    fn archive_active_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.archive_active_thread_impl(window, cx);
     }
 
     fn serialized_state(&self, _cx: &App) -> Option<String> {
