@@ -352,7 +352,7 @@ impl LspLocationsPicker {
         cx: &mut Context<Self>,
     ) -> Self {
         let preview = picker_preview::editor_preview(project.clone(), window, cx);
-        let delegate = LspLocationsDelegate::new(kind, matches, project, editor);
+        let delegate = LspLocationsDelegate::new(kind, matches, project, editor, cx);
         let picker = cx.new(|cx| Picker::list_with_preview(delegate, preview, window, cx));
         let subscription = cx.subscribe(&picker, |_, _, _: &DismissEvent, cx| {
             cx.emit(DismissEvent);
@@ -403,6 +403,7 @@ struct LspLocationsDelegate {
     kind: LspPickerKind,
     project: Entity<Project>,
     editor: WeakEntity<Editor>,
+    workspace: Option<WeakEntity<Workspace>>,
     all_matches: Vec<LocationMatch>,
     candidates: Arc<[StringMatchCandidate]>,
     matches: Vec<usize>,
@@ -417,6 +418,7 @@ impl LspLocationsDelegate {
         all_matches: Vec<LocationMatch>,
         project: Entity<Project>,
         editor: WeakEntity<Editor>,
+        cx: &App,
     ) -> Self {
         // Match against the line text and the file path, mirroring the fuzzy
         // matching every other Zed picker uses.
@@ -435,10 +437,15 @@ impl LspLocationsDelegate {
             })
             .collect();
         let matches = (0..all_matches.len()).collect();
+        let workspace = editor
+            .upgrade()
+            .and_then(|editor| editor.read(cx).workspace())
+            .map(|workspace| workspace.downgrade());
         let mut this = Self {
             kind,
             project,
             editor,
+            workspace,
             all_matches,
             candidates,
             matches,
@@ -617,6 +624,45 @@ impl PickerDelegate for LspLocationsDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) {
         self.selected_index = ix;
+    }
+
+    fn selected_index_changed(
+        &self,
+        ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<Box<dyn Fn(&mut Window, &mut App) + 'static>> {
+        let Entry::Match(match_index) = self.entries.get(ix)? else {
+            return None;
+        };
+        let location_match = self.all_matches.get(*match_index)?;
+        let path = location_match.path.clone();
+        let point = location_match
+            .buffer
+            .read(cx)
+            .snapshot()
+            .offset_to_point(location_match.range.start);
+        let workspace = self.workspace.clone()?;
+
+        Some(Box::new(move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            let open_task = workspace.update(cx, |workspace, cx| {
+                workspace.open_path_preview(path.clone(), None, false, true, true, window, cx)
+            });
+            window
+                .spawn(cx, async move |cx| {
+                    let item = open_task.await?;
+                    if let Some(editor) = item.downcast::<Editor>() {
+                        editor.update_in(cx, |editor, window, cx| {
+                            editor.go_to_singleton_buffer_point(point, window, cx);
+                        })?;
+                    }
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+        }))
     }
 
     fn update_matches(
@@ -888,6 +934,52 @@ mod tests {
             active_picker(&mut cx).is_some(),
             "multiple references should open the picker"
         );
+    }
+
+    #[gpui::test]
+    async fn test_selection_change_navigates_without_dismissing_picker(cx: &mut TestAppContext) {
+        let mut cx = rust_cx(
+            lsp::ServerCapabilities {
+                references_provider: Some(lsp::OneOf::Left(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.set_state(SOURCE);
+        cx.lsp
+            .set_request_handler::<lsp::request::References, _, _>(async move |params, _| {
+                let uri = params.text_document_position.text_document.uri;
+                Ok(Some(references(uri, &[(1, 8, 11), (2, 14, 17)])))
+            });
+
+        open(&mut cx, LspPickerKind::References);
+        let modal = active_picker(&mut cx).expect("multiple references should open the picker");
+        let picker = cx.update(|_window, cx| modal.read(cx).picker.clone());
+        cx.update(|window, cx| {
+            picker.update(cx, |picker, cx| {
+                let next_index = picker.delegate.selected_index() + 1;
+                picker.set_selected_index(
+                    next_index,
+                    Some(picker::Direction::Down),
+                    true,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            active_picker(&mut cx).is_some(),
+            "moving the selection should keep the picker open"
+        );
+        cx.assert_editor_state(indoc! {r#"
+            fn main() {
+                let abc = 123;
+                let xyz = ˇabc;
+            }
+        "#});
     }
 
     #[gpui::test]

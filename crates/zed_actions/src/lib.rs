@@ -591,6 +591,10 @@ pub mod agent {
             /// Toggles the language model selector dropdown.
             #[action(deprecated_aliases = ["assistant::ToggleModelSelector", "assistant2::ToggleModelSelector"])]
             ToggleModelSelector,
+            /// Renames the currently active AI thread.
+            RenameActiveThread,
+            /// Archives the currently active AI thread.
+            ArchiveActiveThread,
             /// Triggers re-authentication on Gemini
             ReauthenticateAgent,
             /// Logs out of the current external agent
@@ -926,6 +930,11 @@ pub mod agents_sidebar {
     use gpui::{Action, actions};
     use schemars::JsonSchema;
     use serde::Deserialize;
+
+    /// Activates an AI thread by its zero-based position in the visible sidebar order.
+    #[derive(PartialEq, Clone, Deserialize, JsonSchema, Default, Action)]
+    #[action(namespace = agents_sidebar)]
+    pub struct ActivateThread(pub usize);
 
     /// Toggles the thread switcher popup when the sidebar is focused.
     #[derive(PartialEq, Clone, Deserialize, JsonSchema, Default, Action)]

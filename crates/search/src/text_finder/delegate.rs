@@ -506,32 +506,15 @@ impl Delegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        let path = search_match.path.clone();
-        let row = search_match.line_number.saturating_sub(1);
-        let column = search_match.match_start_byte_column;
-        let Some(workspace) = self.project_search_view.read(cx).workspace.upgrade() else {
-            return;
-        };
-        let open_task = workspace.update(cx, |workspace, cx| {
-            workspace.open_path_preview(path, pane, focus, false, true, window, cx)
-        });
-        cx.spawn_in(window, async move |_, cx| {
-            let item = open_task.await.log_err()?;
-            if let Some(active_editor) = item.downcast::<editor::Editor>() {
-                active_editor
-                    .downgrade()
-                    .update_in(cx, |editor, window, cx| {
-                        editor.go_to_singleton_buffer_point(
-                            text::Point::new(row, column),
-                            window,
-                            cx,
-                        );
-                    })
-                    .log_err();
-            }
-            Some(())
-        })
-        .detach();
+        open_search_match(
+            self.project_search_view.clone(),
+            search_match.clone(),
+            pane,
+            focus,
+            false,
+            window,
+            cx,
+        );
     }
 
     /// Opens the selected match in a new split in `direction`, then dismisses.
@@ -843,6 +826,27 @@ impl PickerDelegate for Delegate {
     ) {
         self.selected_index = ix;
         self.last_selection_change_time = Some(std::time::Instant::now());
+    }
+
+    fn selected_index_changed(
+        &self,
+        ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Box<dyn Fn(&mut Window, &mut App) + 'static>> {
+        let search_match = self.search_match_for_entry(ix)?.clone();
+        let project_search_view = self.project_search_view.clone();
+        Some(Box::new(move |window, cx| {
+            open_search_match(
+                project_search_view.clone(),
+                search_match.clone(),
+                None,
+                false,
+                true,
+                window,
+                cx,
+            );
+        }))
     }
 
     fn update_matches(
@@ -1316,6 +1320,37 @@ async fn stream_results_to_picker(
     None
 }
 
+fn open_search_match(
+    project_search_view: Entity<ProjectSearchView>,
+    search_match: SearchMatch,
+    pane: Option<WeakEntity<Pane>>,
+    focus: bool,
+    allow_preview: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let path = search_match.path;
+    let row = search_match.line_number.saturating_sub(1);
+    let column = search_match.match_start_byte_column;
+    let Some(workspace) = project_search_view.read(cx).workspace.upgrade() else {
+        return;
+    };
+    let open_task = workspace.update(cx, |workspace, cx| {
+        workspace.open_path_preview(path, pane, focus, allow_preview, true, window, cx)
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let item = open_task.await?;
+            if let Some(editor) = item.downcast::<Editor>() {
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.go_to_singleton_buffer_point(text::Point::new(row, column), window, cx);
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
 /// Byte range around the match to render: a bounded slice of the matched line so rendering never scales with line length.
 fn matched_line_window(
     snapshot: &language::BufferSnapshot,
@@ -1570,6 +1605,74 @@ mod tests {
                 Search::MAX_SEARCH_RESULT_RANGES
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_selection_change_opens_match_in_editor_preview(cx: &mut TestAppContext) {
+        use workspace::MultiWorkspace;
+
+        init_test(cx);
+        let project = project_with_file(cx, "needle one\nother\nneedle two".into()).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let delegate = window
+            .update(cx, |_multi_workspace, window, cx| {
+                workspace.update(cx, |workspace, cx| Delegate::new(workspace, window, cx))
+            })
+            .unwrap()
+            .await;
+        let picker = window
+            .update(cx, |_multi_workspace, window, cx| {
+                cx.new(|cx| Picker::list(delegate, window, cx))
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_multi_workspace, window, cx| {
+                picker.update(cx, |picker, cx| picker.set_query("needle", window, cx))
+            })
+            .unwrap();
+        cx.executor()
+            .advance_clock(SEARCH_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_multi_workspace, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    let next_index = picker.delegate.selected_index() + 1;
+                    picker.set_selected_index(
+                        next_index,
+                        Some(picker::Direction::Down),
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_multi_workspace, _window, cx| {
+                let editor = workspace
+                    .read(cx)
+                    .active_item_as::<Editor>(cx)
+                    .expect("selection change should open an editor preview");
+                editor.update(cx, |editor, cx| {
+                    let selection = editor
+                        .selections
+                        .all_adjusted(&editor.display_snapshot(cx))
+                        .into_iter()
+                        .next()
+                        .expect("preview editor should have a cursor");
+                    assert_eq!(selection.start.row, 2);
+                    assert_eq!(selection.start.column, 0);
+                });
+            })
+            .unwrap();
     }
 
     #[gpui::test]
