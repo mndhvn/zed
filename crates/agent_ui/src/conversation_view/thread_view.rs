@@ -12502,6 +12502,22 @@ impl Render for ThreadView {
                 this.cycle_native_agent_thinking_effort(cx);
             }))
             .on_action(
+                cx.listener(|this, _: &CycleFavoriteThinkingEfforts, _window, cx| {
+                    if this.thread.read(cx).status() != ThreadStatus::Idle {
+                        return;
+                    }
+                    if let Some(config_options_view) = this.config_options_view.clone() {
+                        config_options_view.update(cx, |view, cx| {
+                            view.cycle_category_option(
+                                acp::SessionConfigOptionCategory::ThoughtLevel,
+                                true,
+                                cx,
+                            );
+                        });
+                    }
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &ToggleThinkingEffortMenu, window, cx| {
                     if this.thread.read(cx).status() != ThreadStatus::Idle {
                         return;
