@@ -24,8 +24,8 @@ use zed_actions::agent::ToggleModelSelector;
 
 use crate::ui::documentation_aside_side;
 use crate::{
-    CycleFavoriteModels, CycleModeSelector, CycleThinkingEffort, ToggleProfileSelector,
-    ToggleThinkingEffortMenu,
+    CycleFavoriteModels, CycleFavoriteThinkingEfforts, CycleModeSelector, CycleThinkingEffort,
+    ToggleProfileSelector, ToggleThinkingEffortMenu,
 };
 
 const PICKER_THRESHOLD: usize = 5;
@@ -521,6 +521,10 @@ impl Render for ConfigOptionSelector {
                                     .child(action_tooltip_container(
                                         "Cycle Thinking Effort",
                                         KeyBinding::for_action(&CycleThinkingEffort, cx),
+                                    ))
+                                    .child(action_tooltip_container(
+                                        "Cycle Favorite Thinking Efforts",
+                                        KeyBinding::for_action(&CycleFavoriteThinkingEfforts, cx),
                                     ));
                             }
                             _ => {}
@@ -1157,6 +1161,59 @@ mod tests {
     }
 
     #[gpui::test]
+    fn cycling_favorite_thinking_efforts_skips_unfavorited_values(cx: &mut TestAppContext) {
+        let agent_server = Rc::new(TestAgentServer {
+            favorite_values: [
+                acp::SessionConfigValueId::new("medium"),
+                acp::SessionConfigValueId::new("xhigh"),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select(
+                "effort",
+                "Thinking Effort",
+                "low",
+                vec![
+                    acp::SessionConfigSelectOption::new("low", "Low"),
+                    acp::SessionConfigSelectOption::new("medium", "Medium"),
+                    acp::SessionConfigSelectOption::new("high", "High"),
+                    acp::SessionConfigSelectOption::new("xhigh", "Extra High"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::ThoughtLevel),
+        ]));
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server.clone();
+            let view = cx.new(|_| ConfigOptionsView {
+                config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
+                config_options,
+                selectors: Vec::new(),
+                agent_server,
+                fs,
+                _refresh_task: Task::ready(()),
+            });
+
+            assert!(view.update(cx, |view, cx| {
+                view.cycle_category_option(acp::SessionConfigOptionCategory::ThoughtLevel, true, cx)
+            }));
+        });
+
+        assert_eq!(
+            config_options.set_values.borrow().as_slice(),
+            &[(
+                "effort".to_string(),
+                acp::SessionConfigOptionValue::value_id("medium")
+            )]
+        );
+    }
+
+    #[gpui::test]
     fn cycling_boolean_config_option_saves_selected_value_as_default(cx: &mut TestAppContext) {
         let agent_server = Rc::new(TestAgentServer::default());
         let config_options = Rc::new(TestSessionConfigOptions::new(vec![
@@ -1281,6 +1338,7 @@ mod tests {
     #[derive(Default)]
     struct TestAgentServer {
         saved_defaults: Arc<Mutex<Vec<(String, Option<AgentConfigOptionValue>)>>>,
+        favorite_values: HashSet<acp::SessionConfigValueId>,
     }
 
     impl AgentServer for TestAgentServer {
@@ -1315,6 +1373,14 @@ mod tests {
             self.saved_defaults
                 .lock()
                 .push((config_id.to_string(), value));
+        }
+
+        fn favorite_config_option_value_ids(
+            &self,
+            _config_id: &acp::SessionConfigId,
+            _cx: &mut App,
+        ) -> HashSet<acp::SessionConfigValueId> {
+            self.favorite_values.clone()
         }
     }
 

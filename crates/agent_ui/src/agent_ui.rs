@@ -302,6 +302,8 @@ actions!(
         ToggleThinkingMode,
         /// Cycles through available thinking effort levels for the current model.
         CycleThinkingEffort,
+        /// Cycles through favorited thinking effort levels exposed by an ACP agent.
+        CycleFavoriteThinkingEfforts,
         /// Toggles the thinking effort selector menu open or closed.
         ToggleThinkingEffortMenu,
         /// Toggles fast mode for models that support it.
