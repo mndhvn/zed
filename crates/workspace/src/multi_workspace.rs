@@ -17,7 +17,8 @@ use std::rc::Rc;
 use ui::prelude::*;
 use util::ResultExt;
 use util::path_list::PathList;
-use zed_actions::agents_sidebar::ToggleThreadSwitcher;
+use zed_actions::agent::{ArchiveActiveThread, RenameActiveThread};
+use zed_actions::agents_sidebar::{ActivateThread, ToggleThreadSwitcher};
 
 use agent_settings::AgentSettings;
 use settings::SidebarDockPosition;
@@ -144,6 +145,21 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     /// Activates the next or previous thread in sidebar order.
     fn cycle_thread(&mut self, _forward: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    /// Activates an AI thread by its zero-based position in the visible sidebar order.
+    fn activate_thread_at_index(
+        &mut self,
+        _index: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// Renames the currently active AI thread.
+    fn rename_active_thread(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Archives the currently active AI thread.
+    fn archive_active_thread(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     /// Return an opaque JSON blob of sidebar-specific state to persist.
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         None
@@ -171,6 +187,9 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn toggle_thread_switcher(&self, select_last: bool, window: &mut Window, cx: &mut App);
     fn cycle_project(&self, forward: bool, window: &mut Window, cx: &mut App);
     fn cycle_thread(&self, forward: bool, window: &mut Window, cx: &mut App);
+    fn activate_thread_at_index(&self, index: usize, window: &mut Window, cx: &mut App);
+    fn rename_active_thread(&self, window: &mut Window, cx: &mut App);
+    fn archive_active_thread(&self, window: &mut Window, cx: &mut App);
 
     fn is_threads_list_view_active(&self, cx: &App) -> bool;
 
@@ -246,6 +265,29 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
             entity.update(cx, |this, cx| {
                 this.cycle_thread(forward, window, cx);
             });
+        });
+    }
+
+    fn activate_thread_at_index(&self, index: usize, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.activate_thread_at_index(index, window, cx);
+            });
+        });
+    }
+
+    fn rename_active_thread(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| this.rename_active_thread(window, cx));
+        });
+    }
+
+    fn archive_active_thread(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| this.archive_active_thread(window, cx));
         });
     }
 
@@ -2137,6 +2179,31 @@ impl Render for MultiWorkspace {
                             }
                         }),
                     )
+                    .on_action(cx.listener(
+                        |this: &mut Self, action: &ActivateThread, window, cx| {
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.activate_thread_at_index(action.0, window, cx);
+                            }
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this: &mut Self, _: &RenameActiveThread, window, cx| {
+                            if !this.sidebar_open() {
+                                this.previous_focus_handle = window.focused(cx);
+                                this.open_sidebar(cx);
+                            }
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.rename_active_thread(window, cx);
+                            }
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this: &mut Self, _: &ArchiveActiveThread, window, cx| {
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.archive_active_thread(window, cx);
+                            }
+                        },
+                    ))
                     .when(self.project_group_keys().len() >= 2, |el| {
                         el.on_action(cx.listener(
                             |this: &mut Self, _: &MoveProjectToNewWindow, window, cx| {

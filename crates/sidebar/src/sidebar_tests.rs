@@ -23,6 +23,10 @@ use std::{
     sync::Arc,
 };
 use util::{path_list::PathList, rel_path::rel_path};
+use zed_actions::{
+    agent::{ArchiveActiveThread, RenameActiveThread},
+    agents_sidebar::ActivateThread,
+};
 
 fn use_unique_metadata_databases(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -978,6 +982,118 @@ async fn test_single_workspace_with_saved_threads(cx: &mut TestAppContext) {
             "  Add inline diff view",
         ]
     );
+}
+
+#[gpui::test]
+async fn test_activate_thread_by_index_counts_only_ai_threads(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Dev Server", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    save_n_test_threads(3, &project, cx).await;
+    cx.run_until_parked();
+
+    let ordered_sessions = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Thread(thread) => thread.metadata.session_id.clone(),
+                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        ordered_sessions,
+        vec![
+            acp::SessionId::new(Arc::from("thread-2")),
+            acp::SessionId::new(Arc::from("thread-1")),
+            acp::SessionId::new(Arc::from("thread-0")),
+        ]
+    );
+
+    cx.dispatch_action(ActivateThread(2));
+    cx.run_until_parked();
+
+    let expected_session = acp::SessionId::new(Arc::from("thread-0"));
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert_active_thread(
+            sidebar,
+            &expected_session,
+            "index 2 should activate the third AI thread and skip terminal rows",
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_active_thread_actions_do_not_require_sidebar_selection(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+    let session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&session_id, &project, cx).await;
+    cx.run_until_parked();
+
+    let thread_id = thread_id_for(&session_id, cx);
+    sidebar.update(cx, |sidebar, _cx| sidebar.selection = None);
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar(window, cx);
+    });
+    cx.run_until_parked();
+    assert!(!multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.sidebar_open()));
+
+    cx.dispatch_action(RenameActiveThread);
+    cx.run_until_parked();
+
+    assert!(multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.sidebar_open()));
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert_eq!(sidebar.renaming_thread_id, Some(thread_id));
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.thread_rename_editor.update(cx, |editor, cx| {
+            editor.set_text("Renamed active thread", window, cx);
+        });
+    });
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.finish_thread_rename(window, cx);
+        sidebar.selection = None;
+    });
+    cx.run_until_parked();
+
+    cx.dispatch_action(ArchiveActiveThread);
+    for _ in 0..4 {
+        cx.run_until_parked();
+    }
+
+    cx.update(|_window, cx| {
+        let metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .cloned()
+            .expect("active thread metadata should still exist after archiving");
+        assert_eq!(
+            metadata.title_override.as_deref(),
+            Some("Renamed active thread")
+        );
+        assert!(metadata.archived, "the active thread should be archived");
+    });
 }
 
 #[gpui::test]
