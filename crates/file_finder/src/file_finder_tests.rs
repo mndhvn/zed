@@ -4359,6 +4359,56 @@ async fn test_open_without_dismiss_keeps_finder_open(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_selection_change_opens_editor_preview_without_dismissing(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "first.txt": "first",
+                "second.txt": "second",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, workspace, cx) = build_find_picker(project, cx);
+    simulate_input(cx, ".txt");
+
+    let expected_title = picker.update_in(cx, |picker, window, cx| {
+        assert!(picker.delegate.matches.len() >= 2);
+        let next_index = 1;
+        let expected_title = picker
+            .delegate
+            .matches
+            .get(next_index)
+            .and_then(|path_match| path_match.abs_path(&picker.delegate.project, cx))
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("the selected file should have a name");
+        picker.set_selected_index(next_index, Some(picker::Direction::Down), true, window, cx);
+        expected_title
+    });
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_modal::<FileFinder>(cx).is_some(),
+            "moving through results should keep the file finder open"
+        );
+        let active_editor = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("moving through results should open an editor preview");
+        assert_eq!(active_editor.read(cx).title(cx), expected_title);
+        assert_eq!(workspace.active_pane().read(cx).items().count(), 1);
+    });
+}
+
+#[gpui::test]
 async fn test_open_without_dismiss_opens_multiple_files(cx: &mut TestAppContext) {
     let app_state = init_test(cx);
     app_state
