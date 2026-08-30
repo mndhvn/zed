@@ -622,6 +622,8 @@ pub struct ThreadView {
     #[cfg(feature = "audio")]
     voice_transcription_in_progress: bool,
     #[cfg(feature = "audio")]
+    voice_send_after_transcription: bool,
+    #[cfg(feature = "audio")]
     _voice_transcription_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
     pub in_flight_prompt: Option<Vec<acp::ContentBlock>>,
@@ -1041,6 +1043,8 @@ impl ThreadView {
             voice_recording: None,
             #[cfg(feature = "audio")]
             voice_transcription_in_progress: false,
+            #[cfg(feature = "audio")]
+            voice_send_after_transcription: false,
             #[cfg(feature = "audio")]
             _voice_transcription_task: None,
             hovered_edited_file_buttons: None,
@@ -5551,6 +5555,28 @@ impl ThreadView {
         }
     }
 
+    fn finish_voice_dictation_and_send(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        #[cfg(feature = "audio")]
+        {
+            if self.voice_recording.is_some() {
+                self.voice_send_after_transcription = true;
+                self.toggle_voice_transcription(window, cx);
+                return true;
+            }
+            if self.voice_transcription_in_progress {
+                self.voice_send_after_transcription = true;
+                return true;
+            }
+        }
+
+        let _ = (window, cx);
+        false
+    }
+
     #[cfg(feature = "audio")]
     fn toggle_voice_transcription(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.voice_transcription_in_progress {
@@ -5564,6 +5590,7 @@ impl ThreadView {
             match audio::MicrophoneRecording::start(input_device) {
                 Ok(recording) => {
                     self._voice_transcription_task = None;
+                    self.voice_send_after_transcription = false;
                     self.voice_recording = Some(recording);
                     cx.notify();
                 }
@@ -5624,11 +5651,15 @@ impl ThreadView {
 
             this.update_in(cx, |this, window, cx| {
                 this.voice_transcription_in_progress = false;
+                let should_send = std::mem::take(&mut this.voice_send_after_transcription);
                 match result {
                     Ok(text) if !text.trim().is_empty() => {
                         this.message_editor.update(cx, |editor, cx| {
                             editor.insert_text(text.trim(), window, cx);
                         });
+                        if should_send {
+                            this.send(window, cx);
+                        }
                     }
                     Ok(_) => this.show_voice_transcription_error("No speech was detected", cx),
                     Err(error) => {
@@ -12213,6 +12244,14 @@ impl ThreadView {
     }
 
     fn toggle_fast_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(config_options_view) = self.config_options_view.clone() {
+            let handled = config_options_view
+                .update(cx, |view, cx| view.toggle_boolean_option("fast-mode", cx));
+            if handled {
+                return;
+            }
+        }
+
         if !self.fast_mode_available(cx) {
             return;
         }
@@ -12345,6 +12384,18 @@ impl Render for ThreadView {
         v_flex()
             .key_context("AcpThread")
             .track_focus(&self.focus_handle)
+            .capture_action(cx.listener(|this, _: &Chat, window, cx| {
+                if !this.finish_voice_dictation_and_send(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .capture_action(
+                cx.listener(|this, _: &editor::actions::Newline, window, cx| {
+                    if !this.finish_voice_dictation_and_send(window, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
                     this.cancel_generation(cx);

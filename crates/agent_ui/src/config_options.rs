@@ -107,7 +107,45 @@ impl ConfigOptionsView {
         let Some(next_value) = self.next_value_for_config(&config_id, favorites_only, cx) else {
             return false;
         };
-        let default_value = setting_value_for_config_option_value(&next_value);
+
+        self.set_config_option(config_id, next_value, cx);
+        true
+    }
+
+    pub fn toggle_boolean_option(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let Some((config_id, next_value)) = self
+            .config_options
+            .config_options()
+            .into_iter()
+            .find_map(|option| {
+                if option.id.0.as_ref() != id {
+                    return None;
+                }
+
+                let acp::SessionConfigKind::Boolean(boolean) = option.kind else {
+                    return None;
+                };
+
+                Some((
+                    option.id,
+                    acp::SessionConfigOptionValue::boolean(!boolean.current_value),
+                ))
+            })
+        else {
+            return false;
+        };
+
+        self.set_config_option(config_id, next_value, cx);
+        true
+    }
+
+    fn set_config_option(
+        &self,
+        config_id: acp::SessionConfigId,
+        value: acp::SessionConfigOptionValue,
+        cx: &mut Context<Self>,
+    ) {
+        let default_value = setting_value_for_config_option_value(&value);
 
         self.agent_server.set_default_config_option(
             config_id.0.as_ref(),
@@ -116,9 +154,7 @@ impl ConfigOptionsView {
             cx,
         );
 
-        let task = self
-            .config_options
-            .set_config_option(config_id, next_value, cx);
+        let task = self.config_options.set_config_option(config_id, value, cx);
 
         cx.spawn(async move |_, _| {
             if let Err(err) = task.await {
@@ -126,8 +162,6 @@ impl ConfigOptionsView {
             }
         })
         .detach();
-
-        true
     }
 
     fn first_config_option_id_matching(
@@ -1251,6 +1285,52 @@ mod tests {
             config_options.set_values.borrow().as_slice(),
             &[(
                 "web_search".to_string(),
+                acp::SessionConfigOptionValue::boolean(true)
+            )]
+        );
+    }
+
+    #[gpui::test]
+    fn toggling_boolean_config_option_by_id_only_changes_that_option(cx: &mut TestAppContext) {
+        let agent_server = Rc::new(TestAgentServer::default());
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::boolean("web_search", "Web Search", false)
+                .category(acp::SessionConfigOptionCategory::ModelConfig),
+            acp::SessionConfigOption::boolean("fast-mode", "Fast Mode", false)
+                .category(acp::SessionConfigOptionCategory::ModelConfig),
+        ]));
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server.clone();
+            let fs = fs.clone();
+            let view = cx.new(|_| ConfigOptionsView {
+                config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
+                config_options,
+                selectors: Vec::new(),
+                agent_server,
+                fs,
+                _refresh_task: Task::ready(()),
+            });
+
+            assert!(view.update(cx, |view, cx| {
+                view.toggle_boolean_option("fast-mode", cx)
+            }));
+            assert!(!view.update(cx, |view, cx| { view.toggle_boolean_option("missing", cx) }));
+        });
+
+        assert_eq!(
+            agent_server.saved_defaults.lock().as_slice(),
+            &[(
+                "fast-mode".to_string(),
+                Some(AgentConfigOptionValue::Boolean(true))
+            )]
+        );
+        assert_eq!(
+            config_options.set_values.borrow().as_slice(),
+            &[(
+                "fast-mode".to_string(),
                 acp::SessionConfigOptionValue::boolean(true)
             )]
         );

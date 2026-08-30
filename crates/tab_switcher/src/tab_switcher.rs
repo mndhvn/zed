@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tab_switcher_tests;
 
-use collections::{HashMap, HashSet};
+use collections::HashSet;
 use editor::items::{
     entry_diagnostic_aware_icon_decoration_and_color, entry_git_aware_label_color,
 };
@@ -500,13 +500,6 @@ impl TabSwitcherDelegate {
         };
 
         let pane = pane.read(cx);
-        let mut history_indices = HashMap::default();
-        pane.activation_history().iter().rev().enumerate().for_each(
-            |(history_index, history_entry)| {
-                history_indices.insert(history_entry.entity_id, history_index);
-            },
-        );
-
         let items: Vec<Box<dyn ItemHandle>> = pane.items().map(|item| item.boxed_clone()).collect();
         items
             .iter()
@@ -520,17 +513,6 @@ impl TabSwitcherDelegate {
                 preview: pane.is_active_preview_item(item.item_id()),
             })
             .for_each(|tab_match| self.matches.push(tab_match));
-
-        let non_history_base = history_indices.len();
-        self.matches.sort_by(move |a, b| {
-            let a_score = *history_indices
-                .get(&a.item.item_id())
-                .unwrap_or(&(a.item_index + non_history_base));
-            let b_score = *history_indices
-                .get(&b.item.item_id())
-                .unwrap_or(&(b.item_index + non_history_base));
-            a_score.cmp(&b_score)
-        });
 
         self.selected_index = if query.is_empty() {
             self.compute_selected_index(selected_item_id, window, cx)
@@ -568,17 +550,39 @@ impl TabSwitcherDelegate {
             return self.selected_index.min(self.matches.len() - 1);
         }
 
+        let active_item_id = if self.is_all_panes {
+            self.workspace
+                .read_with(cx, |workspace, cx| workspace.active_item(cx))
+                .ok()
+                .flatten()
+                .map(|item| item.item_id())
+        } else {
+            self.pane
+                .read_with(cx, |pane, _cx| pane.active_item())
+                .ok()
+                .flatten()
+                .map(|item| item.item_id())
+        };
+        let active_index = active_item_id.and_then(|active_item_id| {
+            self.matches
+                .iter()
+                .position(|tab_match| tab_match.item.item_id() == active_item_id)
+        });
+
         if self.select_last {
-            let item_index = self.matches.len() - 1;
+            let item_index = active_index
+                .map(|active_index| (active_index + self.matches.len() - 1) % self.matches.len())
+                .unwrap_or(self.matches.len() - 1);
             self.set_selected_index(item_index, window, cx);
             return item_index;
         }
 
-        // This only runs when initially opening the picker
-        // Index 0 is already active, so don't preselect it for switching.
         if self.matches.len() > 1 {
-            self.set_selected_index(1, window, cx);
-            return 1;
+            let item_index = active_index
+                .map(|active_index| (active_index + 1) % self.matches.len())
+                .unwrap_or(1);
+            self.set_selected_index(item_index, window, cx);
+            return item_index;
         }
 
         0
