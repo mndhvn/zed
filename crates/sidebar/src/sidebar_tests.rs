@@ -1078,6 +1078,27 @@ async fn test_active_thread_actions_do_not_require_sidebar_selection(cx: &mut Te
     cx.run_until_parked();
 
     cx.dispatch_action(ArchiveActiveThread);
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        let metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .cloned()
+            .expect("active thread metadata should still exist after cancelling archival");
+        assert!(
+            !metadata.archived,
+            "cancelling should keep the thread active"
+        );
+    });
+
+    cx.dispatch_action(ArchiveActiveThread);
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Archive");
     for _ in 0..4 {
         cx.run_until_parked();
     }
@@ -9529,21 +9550,16 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
         cx,
     );
 
-    // All three threads are now live. Thread A was opened last, so it's
-    // the one being viewed. Opening each thread called record_thread_access,
-    // so all three have last_accessed_at set.
-    // Access order is: A (most recent), B, C (oldest).
+    // All three threads are now live. Thread A was opened last, so it is active.
+    // Their visual sidebar order is A, B, C by display time.
 
-    // ── 1. Open switcher: threads sorted by last_accessed_at ─────────────────
+    // ── 1. Open switcher: threads stay in visual sidebar order ───────────────
     focus_sidebar(&sidebar, cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
     });
     cx.run_until_parked();
 
-    // All three have last_accessed_at, so they sort by access time.
-    // A was accessed most recently (it's the currently viewed thread),
-    // then B, then C.
     assert_eq!(
         switcher_ids(&sidebar, cx),
         vec![thread_id_a, thread_id_b, thread_id_c,],
@@ -9551,19 +9567,8 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
     // First ctrl-tab selects the second entry (B).
     assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_b);
 
-    // Dismiss the switcher without confirming.
-    sidebar.update_in(cx, |sidebar, _window, cx| {
-        sidebar.dismiss_thread_switcher(cx);
-    });
-    cx.run_until_parked();
-
-    // ── 2. Confirm on Thread C: it becomes most-recently-accessed ──────
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
-    });
-    cx.run_until_parked();
-
-    // Cycle twice to land on Thread C (index 2).
+    // ── 2. Confirming threads does not reorder the switcher ────────────
+    // Cycle once from Thread B to Thread C (index 2).
     sidebar.read_with(cx, |sidebar, cx| {
         let switcher = sidebar.thread_switcher.as_ref().unwrap();
         assert_eq!(switcher.read(cx).selected_index(), 1);
@@ -9577,8 +9582,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_c);
-
-    assert!(sidebar.update(cx, |sidebar, _cx| sidebar.thread_last_accessed.is_empty()));
 
     // Confirm on Thread C.
     sidebar.update_in(cx, |sidebar, window, cx| {
@@ -9597,13 +9600,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
     });
 
     sidebar.update(cx, |sidebar, _cx| {
-        let last_accessed = sidebar
-            .thread_last_accessed
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(last_accessed.len(), 1);
-        assert!(last_accessed.contains(&thread_id_c));
         assert!(
             is_active_session(&sidebar, &session_id_c),
             "active_entry should be Thread({session_id_c:?})"
@@ -9617,8 +9613,9 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
 
     assert_eq!(
         switcher_ids(&sidebar, cx),
-        vec![thread_id_c, thread_id_a, thread_id_b],
+        vec![thread_id_a, thread_id_b, thread_id_c],
     );
+    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_a);
 
     // Confirm on Thread A.
     sidebar.update_in(cx, |sidebar, window, cx| {
@@ -9629,14 +9626,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     sidebar.update(cx, |sidebar, _cx| {
-        let last_accessed = sidebar
-            .thread_last_accessed
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(last_accessed.len(), 2);
-        assert!(last_accessed.contains(&thread_id_c));
-        assert!(last_accessed.contains(&thread_id_a));
         assert!(
             is_active_session(&sidebar, &session_id_a),
             "active_entry should be Thread({session_id_a:?})"
@@ -9650,14 +9639,9 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
 
     assert_eq!(
         switcher_ids(&sidebar, cx),
-        vec![thread_id_a, thread_id_c, thread_id_b,],
+        vec![thread_id_a, thread_id_b, thread_id_c,],
     );
-
-    sidebar.update_in(cx, |sidebar, _window, cx| {
-        let switcher = sidebar.thread_switcher.as_ref().unwrap();
-        switcher.update(cx, |switcher, cx| switcher.cycle_selection(cx));
-    });
-    cx.run_until_parked();
+    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_b);
 
     // Confirm on Thread B.
     sidebar.update_in(cx, |sidebar, window, cx| {
@@ -9668,22 +9652,13 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     sidebar.update(cx, |sidebar, _cx| {
-        let last_accessed = sidebar
-            .thread_last_accessed
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(last_accessed.len(), 3);
-        assert!(last_accessed.contains(&thread_id_c));
-        assert!(last_accessed.contains(&thread_id_a));
-        assert!(last_accessed.contains(&thread_id_b));
         assert!(
             is_active_session(&sidebar, &session_id_b),
             "active_entry should be Thread({session_id_b:?})"
         );
     });
 
-    // ── 3. Add a historical thread (no last_accessed_at, no message sent) ──
+    // ── 3. A newer historical thread appears first, matching the sidebar ──
     // This thread was never opened in a panel — it only exists in metadata.
     save_thread_metadata(
         acp::SessionId::new(Arc::from("thread-historical")),
@@ -9700,21 +9675,13 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    // Historical Thread has no last_accessed_at and no last_message_sent_or_queued,
-    // so it falls to tier 3 (sorted by created_at). It should appear after all
-    // accessed threads, even though its created_at (June 2024) is much later
-    // than the others.
-    //
-    // But the live threads (A, B, C) each had send_message called which sets
-    // last_message_sent_or_queued. So for the accessed threads (tier 1) the
-    // sort key is last_accessed_at; for Historical Thread (tier 3) it's created_at.
     let session_id_hist = acp::SessionId::new(Arc::from("thread-historical"));
     let thread_id_hist = thread_id_for(&session_id_hist, cx);
 
     let ids = switcher_ids(&sidebar, cx);
     assert_eq!(
         ids,
-        vec![thread_id_b, thread_id_a, thread_id_c, thread_id_hist],
+        vec![thread_id_hist, thread_id_a, thread_id_b, thread_id_c],
     );
 
     sidebar.update_in(cx, |sidebar, _window, cx| {
@@ -9738,18 +9705,17 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    // Both historical threads have no access or message times. They should
-    // appear after accessed threads, sorted by created_at (newest first).
+    // The older historical thread appears last, again matching the sidebar.
     let session_id_old_hist = acp::SessionId::new(Arc::from("thread-old-historical"));
     let thread_id_old_hist = thread_id_for(&session_id_old_hist, cx);
     let ids = switcher_ids(&sidebar, cx);
     assert_eq!(
         ids,
         vec![
-            thread_id_b,
-            thread_id_a,
-            thread_id_c,
             thread_id_hist,
+            thread_id_a,
+            thread_id_b,
+            thread_id_c,
             thread_id_old_hist,
         ],
     );

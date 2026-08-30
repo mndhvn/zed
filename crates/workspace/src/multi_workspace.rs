@@ -3,8 +3,8 @@ use fs::Fs;
 
 use gpui::{
     AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, WeakEntity, Window,
-    WindowId, actions, deferred, px,
+    ManagedView, MouseButton, Pixels, PromptLevel, Render, Subscription, Task, TaskExt, WeakEntity,
+    Window, WindowId, actions, deferred, px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
@@ -2199,10 +2199,25 @@ impl Render for MultiWorkspace {
                         },
                     ))
                     .on_action(cx.listener(
-                        |this: &mut Self, _: &ArchiveActiveThread, window, cx| {
-                            if let Some(sidebar) = &this.sidebar {
-                                sidebar.archive_active_thread(window, cx);
-                            }
+                        |_this: &mut Self, _: &ArchiveActiveThread, window, cx| {
+                            let prompt = window.prompt(
+                                PromptLevel::Warning,
+                                "Are you sure you want to archive this thread?",
+                                Some("You can restore it later from Thread History."),
+                                &["Archive", "Cancel"],
+                                cx,
+                            );
+                            cx.spawn_in(window, async move |this, cx| {
+                                if prompt.await? == 0 {
+                                    this.update_in(cx, |this, window, cx| {
+                                        if let Some(sidebar) = &this.sidebar {
+                                            sidebar.archive_active_thread(window, cx);
+                                        }
+                                    })?;
+                                }
+                                anyhow::Ok(())
+                            })
+                            .detach_and_log_err(cx);
                         },
                     ))
                     .when(self.project_group_keys().len() >= 2, |el| {
