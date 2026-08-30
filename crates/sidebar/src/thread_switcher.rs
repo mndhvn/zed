@@ -199,6 +199,7 @@ pub(crate) struct ThreadSwitcher {
 impl ThreadSwitcher {
     pub fn new(
         entries: Vec<ThreadSwitcherEntry>,
+        active_index: Option<usize>,
         select_last: bool,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
@@ -206,10 +207,13 @@ impl ThreadSwitcher {
         let init_modifiers = window.modifiers().modified().then_some(window.modifiers());
         let selected_index = if entries.is_empty() {
             0
-        } else if select_last {
-            entries.len() - 1
         } else {
-            1.min(entries.len().saturating_sub(1))
+            match (active_index.filter(|ix| *ix < entries.len()), select_last) {
+                (Some(active_index), true) => (active_index + entries.len() - 1) % entries.len(),
+                (Some(active_index), false) => (active_index + 1) % entries.len(),
+                (None, true) => entries.len() - 1,
+                (None, false) => 1.min(entries.len().saturating_sub(1)),
+            }
         };
 
         if let Some(entry) = entries.get(selected_index) {
