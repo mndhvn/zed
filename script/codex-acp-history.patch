@@ -1,0 +1,366 @@
+diff --git a/src/AcpExtensions.ts b/src/AcpExtensions.ts
+index a469d51..a2d36b5 100644
+--- a/src/AcpExtensions.ts
++++ b/src/AcpExtensions.ts
+@@ -26,6 +26,8 @@ export {
+ 
+ export const LEGACY_SET_SESSION_MODEL_METHOD = "session/set_model";
+ export const SESSION_STEERING_METHOD = "_session/steering";
++export const HISTORY_EDIT_METHOD = "_session/fork_edit";
++export const SESSION_FORK_METHOD = "_session/fork";
+ 
+ export type LegacySessionModel = {
+     modelId: string;
+@@ -62,6 +64,8 @@ export type ExtMethodRequest =
+     | AuthenticationLogoutRequest
+     | LegacySetSessionModelExtRequest
+     | SessionSteeringExtRequest
++    | HistoryEditExtRequest
++    | SessionForkExtRequest
+     | GoalControlExtRequest
+ 
+ export function isExtMethodRequest(request: { method: string, params: Record<string, unknown> }): request is ExtMethodRequest {
+@@ -70,7 +74,9 @@ export function isExtMethodRequest(request: { method: string, params: Record<str
+         || request.method === LEGACY_SET_SESSION_MODEL_METHOD
+         || request.method === GOAL_CONTROL_METHOD
+         || request.method === LEGACY_GOAL_CONTROL_METHOD
+-        || request.method === SESSION_STEERING_METHOD;
++        || request.method === SESSION_STEERING_METHOD
++        || request.method === HISTORY_EDIT_METHOD
++        || request.method === SESSION_FORK_METHOD;
+ }
+ 
+ export type AuthenticationStatusRequest = { method: "authentication/status", params: {} }
+@@ -110,6 +116,33 @@ export type SessionSteeringExtRequest = {
+     params: SessionSteerRequest;
+ }
+ 
++export type HistoryEditRequest = {
++    sessionId: SessionId;
++    clientUserMessageId: string;
++}
++
++export type HistoryEditResponse = {
++    sessionId: SessionId;
++}
++
++export type HistoryEditExtRequest = {
++    method: typeof HISTORY_EDIT_METHOD;
++    params: HistoryEditRequest;
++}
++
++export type SessionForkRequest = {
++    sessionId: SessionId;
++}
++
++export type SessionForkResponse = {
++    sessionId: SessionId;
++}
++
++export type SessionForkExtRequest = {
++    method: typeof SESSION_FORK_METHOD;
++    params: SessionForkRequest;
++}
++
+ export async function steerSessionWithFallback(
+     connection: Pick<ClientContext, "request">,
+     params: SessionSteerRequest,
+diff --git a/src/CodexAcpClient.ts b/src/CodexAcpClient.ts
+index 4e7f2aa..4fd4fdb 100644
+--- a/src/CodexAcpClient.ts
++++ b/src/CodexAcpClient.ts
+@@ -520,6 +520,89 @@ export class CodexAcpClient {
+         };
+     }
+ 
++    async forkSessionBeforeClientMessage(
++        sessionId: string,
++        clientUserMessageId: string,
++        cwd: string,
++        additionalDirectories: string[],
++        mcpServers: acp.McpServer[],
++        modelProvider: string | null,
++    ): Promise<string> {
++        const history = await this.codexClient.threadRead({
++            threadId: sessionId,
++            includeTurns: true,
++        });
++        const targetTurnIndex = history.thread.turns.findIndex((turn) =>
++            turn.items.some((item) =>
++                item.type === "userMessage" && item.clientId === clientUserMessageId
++            )
++        );
++        if (targetTurnIndex < 0) {
++            throw RequestError.invalidParams(
++                undefined,
++                `No Codex turn found for client user message ${clientUserMessageId}`,
++            );
++        }
++
++        await this.refreshSkills(cwd, additionalDirectories);
++        const config = await this.createSessionConfig(cwd, additionalDirectories, mcpServers);
++        if (targetTurnIndex === 0) {
++            const response = await this.codexClient.threadStart({
++                config,
++                cwd,
++                modelProvider,
++            });
++            return response.thread.id;
++        }
++
++        const previousTurn = history.thread.turns[targetTurnIndex - 1];
++        if (!previousTurn) {
++            throw RequestError.internalError(undefined, "Codex history is missing the preceding turn");
++        }
++        const response = await this.codexClient.threadFork({
++            threadId: sessionId,
++            lastTurnId: previousTurn.id,
++            config,
++            cwd,
++            modelProvider,
++        });
++        return response.thread.id;
++    }
++
++    async forkSession(
++        sessionId: string,
++        cwd: string,
++        additionalDirectories: string[],
++        mcpServers: acp.McpServer[],
++        modelProvider: string | null,
++    ): Promise<string> {
++        const history = await this.codexClient.threadRead({
++            threadId: sessionId,
++            includeTurns: true,
++        });
++
++        await this.refreshSkills(cwd, additionalDirectories);
++        const config = await this.createSessionConfig(cwd, additionalDirectories, mcpServers);
++        const lastTurn = history.thread.turns.at(-1);
++        if (!lastTurn) {
++            const response = await this.codexClient.threadStart({
++                config,
++                cwd,
++                modelProvider,
++            });
++            return response.thread.id;
++        }
++
++        const response = await this.codexClient.threadFork({
++            threadId: sessionId,
++            lastTurnId: lastTurn.id,
++            config,
++            cwd,
++            modelProvider,
++        });
++        return response.thread.id;
++    }
++
+     async closeSession(sessionId: string): Promise<void> {
+         try {
+             await this.codexClient.threadUnsubscribe({threadId: sessionId});
+@@ -838,8 +921,10 @@ export class CodexAcpClient {
+         if (shouldCancel?.()) {
+             return null;
+         }
++        const clientUserMessageId = clientUserMessageIdFromMeta(request._meta);
+         return await this.codexClient.runTurn({
+             threadId: request.sessionId,
++            ...(clientUserMessageId !== null ? {clientUserMessageId} : {}),
+             input: input,
+             approvalPolicy: agentMode.approvalPolicy,
+             sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
+@@ -1345,6 +1430,19 @@ function readAdditionalDirectories(cwd: string, additionalDirectories?: string[]
+     return directories;
+ }
+ 
++function clientUserMessageIdFromMeta(
++    meta: Record<string, unknown> | null | undefined,
++): string | null {
++    const codex = meta?.["codex"];
++    if (typeof codex !== "object" || codex === null || Array.isArray(codex)) {
++        return null;
++    }
++    const clientUserMessageId = (codex as Record<string, unknown>)["clientUserMessageId"];
++    return typeof clientUserMessageId === "string" && clientUserMessageId.length > 0
++        ? clientUserMessageId
++        : null;
++}
++
+ function mergeSandboxWorkspaceWriteRoots(config: JsonObject, roots: string[]): JsonObject {
+     if (roots.length === 0) {
+         return config;
+diff --git a/src/CodexAcpServer.ts b/src/CodexAcpServer.ts
+index 6e0c394..fdc37d2 100644
+--- a/src/CodexAcpServer.ts
++++ b/src/CodexAcpServer.ts
+@@ -48,9 +48,11 @@ import {
+     GOAL_CONTROL_ACTIONS,
+     GOAL_CONTROL_METHOD,
+     GOAL_EXTENSION_VERSION,
++    HISTORY_EDIT_METHOD,
+     isExtMethodRequest,
+     LEGACY_GOAL_CONTROL_METHOD,
+     LEGACY_SET_SESSION_MODEL_METHOD,
++    SESSION_FORK_METHOD,
+     type LegacyLoadSessionResponse,
+     type LegacyNewSessionResponse,
+     type LegacyResumeSessionResponse,
+@@ -350,6 +352,15 @@ export class CodexAcpServer {
+                     controlMethod: GOAL_CONTROL_METHOD,
+                     actions: [...GOAL_CONTROL_ACTIONS],
+                 },
++                codex: {
++                    historyEditing: {
++                        clientUserMessageIds: true,
++                        method: HISTORY_EDIT_METHOD,
++                    },
++                    sessionForking: {
++                        method: SESSION_FORK_METHOD,
++                    },
++                },
+                 [JETBRAINS_META_KEY]: {
+                     [AIR_META_KEY]: {
+                         [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
+@@ -379,6 +390,10 @@ export class CodexAcpServer {
+                 return await this.unstable_setSessionModel(this.parseLegacySetSessionModelParams(methodRequest.params));
+             case SESSION_STEERING_METHOD:
+                 return await this.executeOrQueueSteeringRequest(this.parseSessionSteerParams(methodRequest.params));
++            case HISTORY_EDIT_METHOD:
++                return await this.forkEditedHistory(methodRequest.params);
++            case SESSION_FORK_METHOD:
++                return await this.forkSession(methodRequest.params);
+             case GOAL_CONTROL_METHOD:
+             case LEGACY_GOAL_CONTROL_METHOD: {
+                 const sessionState = this.sessions.get(methodRequest.params.sessionId);
+@@ -442,6 +457,75 @@ export class CodexAcpServer {
+         }
+     }
+ 
++    private async forkEditedHistory(
++        params: {sessionId: string; clientUserMessageId: string},
++    ): Promise<{sessionId: string}> {
++        if (this.providerUpdate !== null) {
++            await this.providerUpdate;
++        }
++        const sessionState = this.getSessionState(params.sessionId);
++        if (this.activePrompts.has(params.sessionId) || sessionState.currentTurnId !== null) {
++            throw RequestError.invalidRequest("Cannot edit history while a Codex turn is active");
++        }
++
++        const oldSessionId = params.sessionId;
++        const newSessionId = await this.runWithProcessCheck(() =>
++            this.codexAcpClient.forkSessionBeforeClientMessage(
++                oldSessionId,
++                params.clientUserMessageId,
++                sessionState.cwd,
++                sessionState.additionalDirectories,
++                sessionState.mcpServers ?? [],
++                sessionState.authProvider,
++            )
++        );
++        await this.codexAcpClient.closeSession(oldSessionId);
++        this.sessions.delete(oldSessionId);
++        sessionState.sessionId = newSessionId;
++        sessionState.currentTurnId = null;
++        this.sessions.set(newSessionId, sessionState);
++        this.moveSessionMapEntry(this.pendingMcpStartupSessions, oldSessionId, newSessionId);
++        this.moveSessionMapEntry(this.pendingTurnStarts, oldSessionId, newSessionId);
++        this.moveSessionMapEntry(this.steeringQueues, oldSessionId, newSessionId);
++        this.sessionGenerations.delete(oldSessionId);
++        this.sessionOpenGenerations.delete(oldSessionId);
++        this.goalControlGenerations.delete(oldSessionId);
++        return {sessionId: newSessionId};
++    }
++
++    private async forkSession(params: {sessionId: string}): Promise<{sessionId: string}> {
++        if (this.providerUpdate !== null) {
++            await this.providerUpdate;
++        }
++        const sessionState = this.getSessionState(params.sessionId);
++        if (this.activePrompts.has(params.sessionId) || sessionState.currentTurnId !== null) {
++            throw RequestError.invalidRequest("Cannot fork a session while a Codex turn is active");
++        }
++
++        const newSessionId = await this.runWithProcessCheck(() =>
++            this.codexAcpClient.forkSession(
++                params.sessionId,
++                sessionState.cwd,
++                sessionState.additionalDirectories,
++                sessionState.mcpServers ?? [],
++                sessionState.authProvider,
++            )
++        );
++        return {sessionId: newSessionId};
++    }
++
++    private moveSessionMapEntry<T>(
++        map: Map<string, T>,
++        oldSessionId: string,
++        newSessionId: string,
++    ): void {
++        const value = map.get(oldSessionId);
++        map.delete(oldSessionId);
++        if (value !== undefined) {
++            map.set(newSessionId, value);
++        }
++    }
++
+     async checkAuthorization(){
+         const authNeeded = await this.runWithProcessCheck(() => this.codexAcpClient.authRequired());
+         logger.log("Auth requirement checked", {authRequired: authNeeded});
+@@ -1836,10 +1920,13 @@ export class CodexAcpServer {
+     private createUserMessageUpdates(item: ThreadItem & { type: "userMessage" }): UpdateSessionEvent[] {
+         const updates: UpdateSessionEvent[] = [];
+         const messageId = item.id;
++        const meta = item.clientId
++            ? {codex: {clientUserMessageId: item.clientId}}
++            : undefined;
+         for (const input of item.content) {
+             const blocks = this.userInputToContentBlocks(input);
+             for (const block of blocks) {
+-                updates.push(createUserMessageChunk(block, messageId));
++                updates.push(createUserMessageChunk(block, messageId, meta));
+             }
+         }
+         return updates;
+diff --git a/src/index.ts b/src/index.ts
+index 15ad225..6c7a179 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -13,8 +13,8 @@ import {logger} from "./Logger";
+ import {runLoginCommand} from "./login";
+ import {runCodexCli} from "./CodexCli";
+ import {
+-    GOAL_CONTROL_METHOD, LEGACY_SET_SESSION_MODEL_METHOD,
+-    SESSION_STEERING_METHOD,
++    GOAL_CONTROL_METHOD, HISTORY_EDIT_METHOD, LEGACY_SET_SESSION_MODEL_METHOD,
++    SESSION_FORK_METHOD, SESSION_STEERING_METHOD,
+ } from "./AcpExtensions";
+ 
+ const emptyExtensionParamsParser = z.preprocess(
+@@ -44,6 +44,15 @@ const goalControlParamsParser = z.discriminatedUnion("action", [
+     }).passthrough(),
+ ]);
+ 
++const historyEditParamsParser = z.object({
++    sessionId: z.string(),
++    clientUserMessageId: z.string().min(1),
++}).passthrough();
++
++const sessionForkParamsParser = z.object({
++    sessionId: z.string(),
++}).passthrough();
++
+ if (process.argv.includes("--version")) {
+     console.log(`${packageJson.name} ${packageJson.version}`);
+     process.exit(0);
+@@ -160,6 +169,8 @@ function startAcpServer() {
+         .onRequest("authentication/logout", emptyExtensionParamsParser, (ctx) => getAgent().extMethod("authentication/logout", ctx.params))
+         .onRequest(LEGACY_SET_SESSION_MODEL_METHOD, legacySetSessionModelParamsParser, (ctx) => getAgent().extMethod(LEGACY_SET_SESSION_MODEL_METHOD, ctx.params))
+         .onRequest(SESSION_STEERING_METHOD, sessionSteerParamsParser, (ctx) => getAgent().extMethod(SESSION_STEERING_METHOD, ctx.params))
++        .onRequest(HISTORY_EDIT_METHOD, historyEditParamsParser, (ctx) => getAgent().extMethod(HISTORY_EDIT_METHOD, ctx.params))
++        .onRequest(SESSION_FORK_METHOD, sessionForkParamsParser, (ctx) => getAgent().extMethod(SESSION_FORK_METHOD, ctx.params))
+         .onRequest(GOAL_CONTROL_METHOD, goalControlParamsParser, (ctx) => getAgent().extMethod(GOAL_CONTROL_METHOD, ctx.params))
+         .connect(acpJsonStream);
+ }

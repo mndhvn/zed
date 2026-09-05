@@ -2834,6 +2834,30 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         })
     }
 
+    fn fork(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        self.0.read_with(cx, |agent, _cx| {
+            let session = agent.sessions.get(session_id)?;
+            let project_state = agent.projects.get(&session.project_id)?;
+            let folder_paths = PathList::new(
+                &project_state
+                    .project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>(),
+            );
+            Some(Rc::new(NativeAgentSessionFork {
+                source_thread: session.thread.clone(),
+                thread_store: agent.thread_store.clone(),
+                folder_paths,
+            }) as _)
+        })
+    }
+
     fn set_title(
         &self,
         session_id: &acp::SessionId,
@@ -3123,6 +3147,36 @@ impl AgentSessionList for NativeAgentSessionList {
 struct NativeAgentSessionTruncate {
     thread: Entity<Thread>,
     acp_thread: WeakEntity<AcpThread>,
+}
+
+struct NativeAgentSessionFork {
+    source_thread: Entity<Thread>,
+    thread_store: Entity<ThreadStore>,
+    folder_paths: PathList,
+}
+
+impl acp_thread::AgentSessionFork for NativeAgentSessionFork {
+    fn run(&self, title: SharedString, cx: &mut App) -> Task<Result<acp::SessionId>> {
+        let db_thread = self.source_thread.read(cx).to_db(cx);
+        let thread_store = self.thread_store.clone();
+        let folder_paths = self.folder_paths.clone();
+        cx.spawn(async move |cx| {
+            let mut db_thread = db_thread.await;
+            db_thread.title = title;
+            db_thread.updated_at = Utc::now();
+            db_thread.subagent_context = None;
+            db_thread.draft_prompt = None;
+            db_thread.ui_scroll_position = None;
+            db_thread.sandboxed_terminal_temp_dir = None;
+            let session_id = acp::SessionId::new(uuid::Uuid::new_v4().to_string());
+            thread_store
+                .update(cx, |thread_store, cx| {
+                    thread_store.save_thread(session_id.clone(), db_thread, folder_paths, cx)
+                })
+                .await?;
+            Ok(session_id)
+        })
+    }
 }
 
 impl acp_thread::AgentSessionTruncate for NativeAgentSessionTruncate {
@@ -4026,6 +4080,66 @@ mod internal_tests {
             .unwrap();
 
         (connection, agent, project, acp_thread)
+    }
+
+    #[gpui::test]
+    async fn test_fork_session_copies_history_and_preserves_source(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let source_session_id = acp_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        let source_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &source_session_id, cx));
+
+        cx.update(|cx| {
+            let path_style = project.read(cx).path_style(cx);
+            source_thread.update(cx, |thread, cx| {
+                thread.set_title("Source Conversation".into(), cx);
+                thread.push_acp_user_block(
+                    ClientUserMessageId::new(),
+                    [acp::ContentBlock::from("hello")],
+                    path_style,
+                    cx,
+                );
+            });
+        });
+
+        let fork = cx
+            .update(|cx| connection.fork(&source_session_id, cx))
+            .expect("native sessions should support forking");
+        let forked_session_id = cx
+            .update(|cx| fork.run("Source Conversation (Fork)".into(), cx))
+            .await
+            .unwrap();
+
+        let forked_acp_thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    forked_session_id.clone(),
+                    project,
+                    PathList::new(&[Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_ne!(forked_session_id, source_session_id);
+        agent.read_with(cx, |agent, cx| {
+            let source = agent.sessions.get(&source_session_id).unwrap();
+            let forked = agent.sessions.get(&forked_session_id).unwrap();
+            assert_eq!(
+                source.thread.read(cx).title().as_deref(),
+                Some("Source Conversation")
+            );
+            assert_eq!(
+                forked.thread.read(cx).title().as_deref(),
+                Some("Source Conversation (Fork)")
+            );
+            assert!(source.thread.read(cx).last_message().is_some());
+            assert!(forked.thread.read(cx).last_message().is_some());
+            assert_eq!(forked_acp_thread.read(cx).entries().len(), 1);
+        });
     }
 
     fn native_thread_for_session(

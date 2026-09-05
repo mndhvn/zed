@@ -360,6 +360,27 @@ impl AgentServerStore {
             match settings {
                 CustomAgentServerSettings::Custom { command, .. } => {
                     let agent_name = AgentId(name.clone().into());
+                    if name == "codex-acp"
+                        && let Some((codex_acp_path, codex_path)) = bundled_codex_paths()
+                    {
+                        self.external_agents.insert(
+                            agent_name,
+                            ExternalAgentEntry::new(
+                                Box::new(LocalBundledCodexAgent {
+                                    node_runtime: node_runtime.clone(),
+                                    project_environment: project_environment.clone(),
+                                    codex_acp_path,
+                                    codex_path,
+                                    args: command.args.iter().skip(1).cloned().collect(),
+                                    settings_env: command.env.clone().unwrap_or_default(),
+                                }) as Box<dyn ExternalAgentServer>,
+                                ExternalAgentSource::Custom,
+                                None,
+                                None,
+                            ),
+                        );
+                        continue;
+                    }
                     self.external_agents.insert(
                         agent_name.clone(),
                         ExternalAgentEntry::new(
@@ -417,6 +438,30 @@ impl AgentServerStore {
                             );
                         }
                         RegistryAgent::Npx(agent) => {
+                            if name == "codex-acp"
+                                && let Some((codex_acp_path, codex_path)) = bundled_codex_paths()
+                            {
+                                let mut settings_env = agent.env.clone();
+                                settings_env.extend(env.clone());
+                                self.external_agents.insert(
+                                    agent_name,
+                                    ExternalAgentEntry::new(
+                                        Box::new(LocalBundledCodexAgent {
+                                            node_runtime: node_runtime.clone(),
+                                            project_environment: project_environment.clone(),
+                                            codex_acp_path,
+                                            codex_path,
+                                            args: agent.args.clone(),
+                                            settings_env,
+                                        })
+                                            as Box<dyn ExternalAgentServer>,
+                                        ExternalAgentSource::Registry,
+                                        agent.metadata.icon_path.clone(),
+                                        Some(agent.metadata.name.clone()),
+                                    ),
+                                );
+                                continue;
+                            }
                             self.external_agents.insert(
                                 agent_name.clone(),
                                 ExternalAgentEntry::new(
@@ -1470,6 +1515,91 @@ fn bounded_npm_package_spec(package_spec: &str) -> (&str, String) {
 struct LocalCustomAgent {
     project_environment: Entity<ProjectEnvironment>,
     command: AgentServerCommand,
+}
+
+struct LocalBundledCodexAgent {
+    node_runtime: NodeRuntime,
+    project_environment: Entity<ProjectEnvironment>,
+    codex_acp_path: PathBuf,
+    codex_path: PathBuf,
+    args: Vec<String>,
+    settings_env: HashMap<String, String>,
+}
+
+impl ExternalAgentServer for LocalBundledCodexAgent {
+    fn get_command(
+        &mut self,
+        extra_args: Vec<String>,
+        extra_env: HashMap<String, String>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<AgentServerCommand>> {
+        let node_runtime = self.node_runtime.clone();
+        let project_environment = self.project_environment.downgrade();
+        let codex_acp_path = self.codex_acp_path.clone();
+        let codex_path = self.codex_path.clone();
+        let args = self.args.clone();
+        let settings_env = self.settings_env.clone();
+        cx.spawn(async move |cx| {
+            let mut env = project_environment
+                .update(cx, |project_environment, cx| {
+                    project_environment.default_environment(cx)
+                })?
+                .await
+                .unwrap_or_default();
+            let node_binary = node_runtime.binary_path().await?;
+            env.extend(node_runtime::npm_command_env(&node_binary));
+            env.extend(settings_env);
+            env.extend(extra_env);
+            env.insert(
+                "CODEX_PATH".to_string(),
+                codex_path.to_string_lossy().into_owned(),
+            );
+
+            let mut command_args = vec![codex_acp_path.to_string_lossy().into_owned()];
+            command_args.extend(args);
+            command_args.extend(extra_args);
+            Ok(AgentServerCommand {
+                path: node_binary,
+                args: command_args,
+                env: Some(env),
+            })
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+fn bundled_codex_paths() -> Option<(PathBuf, PathBuf)> {
+    let working_directory = std::env::current_dir().ok()?;
+    let resolve = |variable| {
+        let path = PathBuf::from(std::env::var_os(variable)?);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            working_directory.join(path)
+        })
+    };
+    if let Some(paths) =
+        resolve("ZED_BUNDLED_CODEX_ACP_PATH").zip(resolve("ZED_BUNDLED_CODEX_PATH"))
+    {
+        return Some(paths);
+    }
+
+    let executable_path = std::env::current_exe().ok()?;
+    let resources_dir = executable_path.parent()?.parent()?.join("Resources/codex");
+    let codex_acp_path = resources_dir.join("codex-acp.js");
+    let codex_path = resources_dir.join("codex");
+    if codex_acp_path.is_file() && codex_path.is_file() {
+        Some((codex_acp_path, codex_path))
+    } else {
+        None
+    }
 }
 
 impl ExternalAgentServer for LocalCustomAgent {

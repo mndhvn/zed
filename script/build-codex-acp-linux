@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+codex_acp_version="1.6.2"
+codex_acp_commit="9780d314d34616b476b1ae451ad31089b3dce49a"
+workspace_root=$(git rev-parse --show-toplevel)
+target_dir="${CARGO_TARGET_DIR:-target}"
+architecture=$(uname -m)
+
+case "$architecture" in
+    x86_64)
+        codex_package_architecture="x64"
+        ;;
+    aarch64)
+        codex_package_architecture="arm64"
+        ;;
+    *)
+        echo "Unsupported Linux architecture: $architecture" >&2
+        exit 1
+        ;;
+esac
+
+source_dir=$(mktemp -d)
+cleanup() {
+    rm -rf "$source_dir"
+}
+trap cleanup EXIT
+
+git clone --quiet --depth 1 --branch "v${codex_acp_version}" \
+    https://github.com/agentclientprotocol/codex-acp.git "$source_dir"
+
+actual_commit=$(git -C "$source_dir" rev-parse HEAD)
+if [[ "$actual_commit" != "$codex_acp_commit" ]]; then
+    echo "Unexpected codex-acp commit: $actual_commit" >&2
+    exit 1
+fi
+
+git -C "$source_dir" apply "$workspace_root/script/codex-acp-history.patch"
+
+pushd "$source_dir" >/dev/null
+npm ci
+npm run typecheck
+npm run build
+popd >/dev/null
+
+codex_binary=$(find \
+    "$source_dir/node_modules/@openai/codex-linux-${codex_package_architecture}/vendor" \
+    -type f -path '*/bin/codex' -print -quit)
+if [[ -z "$codex_binary" ]]; then
+    echo "The native Codex binary was not installed" >&2
+    exit 1
+fi
+
+mkdir -p "$target_dir"
+remote_server="zed-remote-server-linux-${architecture}.gz"
+codex_acp="zed-codex-acp-linux-${architecture}.js.gz"
+codex="zed-codex-linux-${architecture}.gz"
+archive="zed-ssh-payloads-linux-${architecture}.tar.gz"
+
+gzip -c --best "$source_dir/dist/index.js" > "$target_dir/$codex_acp"
+gzip -c --best "$codex_binary" > "$target_dir/$codex"
+tar -czf "$target_dir/$archive" -C "$target_dir" "$remote_server" "$codex_acp" "$codex"

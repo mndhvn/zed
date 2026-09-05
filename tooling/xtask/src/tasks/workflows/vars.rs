@@ -383,6 +383,8 @@ pub mod assets {
     pub const REMOTE_SERVER_MAC_X86_64: &str = "zed-remote-server-macos-x86_64.gz";
     pub const REMOTE_SERVER_LINUX_AARCH64: &str = "zed-remote-server-linux-aarch64.gz";
     pub const REMOTE_SERVER_LINUX_X86_64: &str = "zed-remote-server-linux-x86_64.gz";
+    pub const SSH_PAYLOADS_LINUX_AARCH64: &str = "zed-ssh-payloads-linux-aarch64.tar.gz";
+    pub const SSH_PAYLOADS_LINUX_X86_64: &str = "zed-ssh-payloads-linux-x86_64.tar.gz";
     pub const REMOTE_SERVER_WINDOWS_AARCH64: &str = "zed-remote-server-windows-aarch64.zip";
     pub const REMOTE_SERVER_WINDOWS_X86_64: &str = "zed-remote-server-windows-x86_64.zip";
 

@@ -42,33 +42,33 @@ async fn test_open_with_prev_tab_selected_and_cycle_on_toggle_action(
     let tab_3 = open_buffer("3.txt", &workspace, cx).await;
     let tab_4 = open_buffer("4.txt", &workspace, cx).await;
 
-    // Starts with the next tab in visual order selected.
+    // Starts with the previously active tab selected.
     let tab_switcher = open_tab_switcher(false, &workspace, cx);
     tab_switcher.update(cx, |tab_switcher, _| {
         assert_eq!(tab_switcher.delegate.matches.len(), 4);
-        assert_match_selection(tab_switcher, 0, tab_1.boxed_clone());
-        assert_match_at_position(tab_switcher, 1, tab_2.boxed_clone());
-        assert_match_at_position(tab_switcher, 2, tab_3.boxed_clone());
-        assert_match_at_position(tab_switcher, 3, tab_4.boxed_clone());
+        assert_match_at_position(tab_switcher, 0, tab_4.boxed_clone());
+        assert_match_selection(tab_switcher, 1, tab_3.boxed_clone());
+        assert_match_at_position(tab_switcher, 2, tab_2.boxed_clone());
+        assert_match_at_position(tab_switcher, 3, tab_1.boxed_clone());
     });
 
     cx.dispatch_action(Toggle { select_last: false });
     cx.dispatch_action(Toggle { select_last: false });
     tab_switcher.update(cx, |tab_switcher, _| {
         assert_eq!(tab_switcher.delegate.matches.len(), 4);
-        assert_match_at_position(tab_switcher, 0, tab_1.boxed_clone());
-        assert_match_at_position(tab_switcher, 1, tab_2.boxed_clone());
-        assert_match_selection(tab_switcher, 2, tab_3.boxed_clone());
-        assert_match_at_position(tab_switcher, 3, tab_4.boxed_clone());
+        assert_match_at_position(tab_switcher, 0, tab_4.boxed_clone());
+        assert_match_at_position(tab_switcher, 1, tab_3.boxed_clone());
+        assert_match_at_position(tab_switcher, 2, tab_2.boxed_clone());
+        assert_match_selection(tab_switcher, 3, tab_1.boxed_clone());
     });
 
     cx.dispatch_action(SelectPrevious);
     tab_switcher.update(cx, |tab_switcher, _| {
         assert_eq!(tab_switcher.delegate.matches.len(), 4);
-        assert_match_at_position(tab_switcher, 0, tab_1.boxed_clone());
-        assert_match_selection(tab_switcher, 1, tab_2.boxed_clone());
-        assert_match_at_position(tab_switcher, 2, tab_3.boxed_clone());
-        assert_match_at_position(tab_switcher, 3, tab_4.boxed_clone());
+        assert_match_at_position(tab_switcher, 0, tab_4.boxed_clone());
+        assert_match_at_position(tab_switcher, 1, tab_3.boxed_clone());
+        assert_match_selection(tab_switcher, 2, tab_2.boxed_clone());
+        assert_match_at_position(tab_switcher, 3, tab_1.boxed_clone());
     });
 }
 
@@ -98,13 +98,13 @@ async fn test_open_with_last_tab_selected(cx: &mut gpui::TestAppContext) {
     let tab_2 = open_buffer("2.txt", &workspace, cx).await;
     let tab_3 = open_buffer("3.txt", &workspace, cx).await;
 
-    // Starts with the previous tab in visual order selected.
+    // Reverse cycling starts with the oldest MRU tab selected.
     let tab_switcher = open_tab_switcher(true, &workspace, cx);
     tab_switcher.update(cx, |tab_switcher, _| {
         assert_eq!(tab_switcher.delegate.matches.len(), 3);
-        assert_match_at_position(tab_switcher, 0, tab_1);
-        assert_match_selection(tab_switcher, 1, tab_2);
-        assert_match_at_position(tab_switcher, 2, tab_3);
+        assert_match_at_position(tab_switcher, 0, tab_3);
+        assert_match_at_position(tab_switcher, 1, tab_2);
+        assert_match_selection(tab_switcher, 2, tab_1);
     });
 }
 
@@ -136,13 +136,102 @@ async fn test_open_item_on_modifiers_release(cx: &mut gpui::TestAppContext) {
     let tab_switcher = open_tab_switcher(false, &workspace, cx);
     tab_switcher.update(cx, |tab_switcher, _| {
         assert_eq!(tab_switcher.delegate.matches.len(), 2);
-        assert_match_selection(tab_switcher, 0, tab_1.boxed_clone());
-        assert_match_at_position(tab_switcher, 1, tab_2.boxed_clone());
+        assert_match_at_position(tab_switcher, 0, tab_2.boxed_clone());
+        assert_match_selection(tab_switcher, 1, tab_1.boxed_clone());
     });
 
     cx.simulate_modifiers_change(Modifiers::none());
     cx.read(|cx| {
         let active_editor = workspace.read(cx).active_item_as::<Editor>(cx).unwrap();
+        assert_eq!(active_editor.read(cx).title(cx), "1.txt");
+    });
+    assert_tab_switcher_is_closed(workspace, cx);
+}
+
+#[gpui::test]
+async fn test_separate_modifier_gestures_toggle_previous_tab(cx: &mut gpui::TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "1.txt": "First file",
+                "2.txt": "Second file",
+                "3.txt": "Third file",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+    open_buffer("1.txt", &workspace, cx).await;
+    open_buffer("2.txt", &workspace, cx).await;
+    open_buffer("3.txt", &workspace, cx).await;
+
+    for expected_title in ["2.txt", "3.txt", "2.txt"] {
+        cx.simulate_modifiers_change(Modifiers::alt());
+        cx.dispatch_action(Toggle::default());
+        cx.run_until_parked();
+        cx.simulate_modifiers_change(Modifiers::none());
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let active_editor = workspace
+                .read(cx)
+                .active_item_as::<Editor>(cx)
+                .expect("an editor should be active");
+            assert_eq!(active_editor.read(cx).title(cx), expected_title);
+        });
+        assert_tab_switcher_is_closed(workspace.clone(), cx);
+    }
+}
+
+#[gpui::test]
+async fn test_repeated_action_in_one_modifier_gesture_cycles_mru_tabs(
+    cx: &mut gpui::TestAppContext,
+) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "1.txt": "First file",
+                "2.txt": "Second file",
+                "3.txt": "Third file",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+    open_buffer("1.txt", &workspace, cx).await;
+    open_buffer("2.txt", &workspace, cx).await;
+    open_buffer("3.txt", &workspace, cx).await;
+
+    cx.simulate_modifiers_change(Modifiers::alt());
+    cx.dispatch_action(Toggle::default());
+    cx.dispatch_action(Toggle::default());
+    cx.run_until_parked();
+    cx.simulate_modifiers_change(Modifiers::none());
+    cx.run_until_parked();
+
+    cx.read(|cx| {
+        let active_editor = workspace
+            .read(cx)
+            .active_item_as::<Editor>(cx)
+            .expect("an editor should be active");
         assert_eq!(active_editor.read(cx).title(cx), "1.txt");
     });
     assert_tab_switcher_is_closed(workspace, cx);
@@ -231,19 +320,19 @@ async fn test_close_selected_item(cx: &mut gpui::TestAppContext) {
     let tab_switcher = open_tab_switcher(false, &workspace, cx);
     tab_switcher.update(cx, |tab_switcher, _| {
         assert_eq!(tab_switcher.delegate.matches.len(), 4);
-        assert_match_at_position(tab_switcher, 0, tab_1.boxed_clone());
-        assert_match_at_position(tab_switcher, 1, tab_3.boxed_clone());
-        assert_match_selection(tab_switcher, 2, tab_2.boxed_clone());
-        assert_match_at_position(tab_switcher, 3, tab_4.boxed_clone());
+        assert_match_at_position(tab_switcher, 0, tab_3.boxed_clone());
+        assert_match_selection(tab_switcher, 1, tab_2.boxed_clone());
+        assert_match_at_position(tab_switcher, 2, tab_4.boxed_clone());
+        assert_match_at_position(tab_switcher, 3, tab_1.boxed_clone());
     });
 
     cx.simulate_modifiers_change(Modifiers::control());
     cx.dispatch_action(CloseSelectedItem);
     tab_switcher.update(cx, |tab_switcher, _| {
         assert_eq!(tab_switcher.delegate.matches.len(), 3);
-        assert_match_at_position(tab_switcher, 0, tab_1);
-        assert_match_selection(tab_switcher, 1, tab_3);
-        assert_match_at_position(tab_switcher, 2, tab_4);
+        assert_match_selection(tab_switcher, 0, tab_3);
+        assert_match_at_position(tab_switcher, 1, tab_4);
+        assert_match_at_position(tab_switcher, 2, tab_1);
     });
 
     // Still switches tab on modifiers release

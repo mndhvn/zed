@@ -29,17 +29,41 @@ pub(crate) fn release() -> Workflow {
     let create_draft_release = create_draft_release();
     let (non_blocking_compliance_run, job_output) = compliance_check();
 
+    let linux_aarch64 = bundle_linux(
+        Arch::AARCH64,
+        None,
+        &[&linux_tests, &linux_clippy, &check_scripts],
+    );
+    let linux_x86_64 = bundle_linux(
+        Arch::X86_64,
+        None,
+        &[&linux_tests, &linux_clippy, &check_scripts],
+    );
+    let mac_aarch64 = bundle_mac(
+        Arch::AARCH64,
+        None,
+        &[
+            &macos_tests,
+            &macos_clippy,
+            &check_scripts,
+            &linux_aarch64,
+            &linux_x86_64,
+        ],
+    );
+    let mac_x86_64 = bundle_mac(
+        Arch::X86_64,
+        None,
+        &[
+            &macos_tests,
+            &macos_clippy,
+            &check_scripts,
+            &linux_aarch64,
+            &linux_x86_64,
+        ],
+    );
     let bundle = ReleaseBundleJobs {
-        linux_aarch64: bundle_linux(
-            Arch::AARCH64,
-            None,
-            &[&linux_tests, &linux_clippy, &check_scripts],
-        ),
-        linux_x86_64: bundle_linux(
-            Arch::X86_64,
-            None,
-            &[&linux_tests, &linux_clippy, &check_scripts],
-        ),
+        linux_aarch64,
+        linux_x86_64,
         bwrap_linux_aarch64: build_static_bwrap(
             Arch::AARCH64,
             &[&linux_tests, &linux_clippy, &check_scripts],
@@ -48,16 +72,8 @@ pub(crate) fn release() -> Workflow {
             Arch::X86_64,
             &[&linux_tests, &linux_clippy, &check_scripts],
         ),
-        mac_aarch64: bundle_mac(
-            Arch::AARCH64,
-            None,
-            &[&macos_tests, &macos_clippy, &check_scripts],
-        ),
-        mac_x86_64: bundle_mac(
-            Arch::X86_64,
-            None,
-            &[&macos_tests, &macos_clippy, &check_scripts],
-        ),
+        mac_aarch64,
+        mac_x86_64,
         windows_aarch64: bundle_windows(
             Arch::AARCH64,
             None,

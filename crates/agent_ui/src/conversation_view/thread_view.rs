@@ -1172,6 +1172,9 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         match command {
+            PromptLocalCommand::Fork => {
+                window.dispatch_action(ForkThread.boxed_clone(), cx);
+            }
             PromptLocalCommand::ThumbsUp => {
                 self.handle_feedback_click(ThreadFeedback::Positive, window, cx);
                 self.show_local_command_toast("Thanks for your feedback!", cx);
@@ -7185,6 +7188,14 @@ impl ThreadView {
     // `sync_local_commands`.
     fn available_local_commands(&self, cx: &App) -> Vec<PromptLocalCommand> {
         let mut commands = Vec::new();
+
+        if self.parent_session_id.is_none()
+            && !self.thread.read(cx).entries().is_empty()
+            && self.thread.read(cx).status() == ThreadStatus::Idle
+            && self.thread.read(cx).supports_fork(cx)
+        {
+            commands.push(PromptLocalCommand::Fork);
+        }
 
         if self.is_thread_feedback_enabled(cx) {
             commands.push(PromptLocalCommand::ThumbsUp);

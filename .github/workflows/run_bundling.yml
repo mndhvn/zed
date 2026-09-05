@@ -33,6 +33,12 @@ jobs:
       with:
         cache: rust
         path: ~/.rustup
+    - name: steps::setup_node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: '24'
+        check-latest: true
+        package-manager-cache: false
     - name: steps::setup_sentry
       uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b
       with:
@@ -43,6 +49,8 @@ jobs:
       run: ./script/download-wasi-sdk
     - name: ./script/bundle-linux
       run: ./script/bundle-linux
+    - name: ./script/build-codex-acp-linux
+      run: ./script/build-codex-acp-linux
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
@@ -54,6 +62,12 @@ jobs:
       with:
         name: zed-remote-server-linux-aarch64.gz
         path: target/zed-remote-server-linux-aarch64.gz
+        if-no-files-found: error
+    - name: run_bundling::upload_artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zed-ssh-payloads-linux-aarch64.tar.gz
+        path: target/zed-ssh-payloads-linux-aarch64.tar.gz
         if-no-files-found: error
     timeout-minutes: 60
   bundle_linux_x86_64:
@@ -77,6 +91,12 @@ jobs:
       with:
         cache: rust
         path: ~/.rustup
+    - name: steps::setup_node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: '24'
+        check-latest: true
+        package-manager-cache: false
     - name: steps::setup_sentry
       uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b
       with:
@@ -87,6 +107,8 @@ jobs:
       run: ./script/download-wasi-sdk
     - name: ./script/bundle-linux
       run: ./script/bundle-linux
+    - name: ./script/build-codex-acp-linux
+      run: ./script/build-codex-acp-linux
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
@@ -98,6 +120,12 @@ jobs:
       with:
         name: zed-remote-server-linux-x86_64.gz
         path: target/zed-remote-server-linux-x86_64.gz
+        if-no-files-found: error
+    - name: run_bundling::upload_artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zed-ssh-payloads-linux-x86_64.tar.gz
+        path: target/zed-ssh-payloads-linux-x86_64.tar.gz
         if-no-files-found: error
     timeout-minutes: 60
   build_static_bwrap_linux_aarch64:
@@ -169,9 +197,9 @@ jobs:
         if-no-files-found: error
     timeout-minutes: 60
   bundle_mac_aarch64:
-    if: |-
-      (github.event.action == 'labeled' && github.event.label.name == 'run-bundling') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'run-bundling'))
+    needs:
+    - bundle_linux_aarch64
+    - bundle_linux_x86_64
     runs-on: namespace-profile-mac-large
     env:
       CARGO_INCREMENTAL: 0
@@ -192,6 +220,16 @@ jobs:
       with:
         cache: rust
         path: ~/.rustup
+    - name: run_bundling::bundle_mac::{closure#0}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: zed-ssh-payloads-linux-aarch64.tar.gz
+        path: target/ssh-payloads
+    - name: run_bundling::bundle_mac::{closure#0}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: zed-ssh-payloads-linux-x86_64.tar.gz
+        path: target/ssh-payloads
     - name: steps::setup_node
       uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
       with:
@@ -220,9 +258,9 @@ jobs:
         if-no-files-found: error
     timeout-minutes: 60
   bundle_mac_x86_64:
-    if: |-
-      (github.event.action == 'labeled' && github.event.label.name == 'run-bundling') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'run-bundling'))
+    needs:
+    - bundle_linux_aarch64
+    - bundle_linux_x86_64
     runs-on: namespace-profile-mac-large
     env:
       CARGO_INCREMENTAL: 0
@@ -243,6 +281,16 @@ jobs:
       with:
         cache: rust
         path: ~/.rustup
+    - name: run_bundling::bundle_mac::{closure#0}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: zed-ssh-payloads-linux-aarch64.tar.gz
+        path: target/ssh-payloads
+    - name: run_bundling::bundle_mac::{closure#0}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: zed-ssh-payloads-linux-x86_64.tar.gz
+        path: target/ssh-payloads
     - name: steps::setup_node
       uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
       with:

@@ -10,7 +10,9 @@ use gpui::{
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use release_channel::ReleaseChannel;
-use remote::{ConnectionIdentifier, RemoteClient, RemoteConnectionOptions, RemotePlatform};
+use remote::{
+    ConnectionIdentifier, RemoteClient, RemoteConnectionOptions, RemotePayload, RemotePlatform,
+};
 use semver::Version;
 use settings::Settings;
 use theme_settings::ThemeSettings;
@@ -535,6 +537,32 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
             .await
         })
     }
+
+    fn bundled_remote_payload(
+        &self,
+        platform: RemotePlatform,
+        payload: RemotePayload,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Option<PathBuf>>> {
+        cx.spawn(async move |cx| {
+            Ok(AutoUpdater::bundled_ssh_payload(&payload.file_name(platform), cx).await)
+        })
+    }
+
+    fn bundled_remote_server_binary(
+        &self,
+        platform: RemotePlatform,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Option<PathBuf>>> {
+        cx.spawn(async move |cx| {
+            let file_name = format!(
+                "zed-remote-server-{}-{}.gz",
+                platform.os.as_str(),
+                platform.arch.as_str()
+            );
+            Ok(AutoUpdater::bundled_ssh_payload(&file_name, cx).await)
+        })
+    }
 }
 
 impl RemoteClientDelegate {
@@ -699,6 +727,32 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
                 cx,
             )
             .await
+        })
+    }
+
+    fn bundled_remote_payload(
+        &self,
+        platform: RemotePlatform,
+        payload: RemotePayload,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Option<PathBuf>>> {
+        cx.spawn(async move |cx| {
+            Ok(AutoUpdater::bundled_ssh_payload(&payload.file_name(platform), cx).await)
+        })
+    }
+
+    fn bundled_remote_server_binary(
+        &self,
+        platform: RemotePlatform,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Option<PathBuf>>> {
+        cx.spawn(async move |cx| {
+            let file_name = format!(
+                "zed-remote-server-{}-{}.gz",
+                platform.os.as_str(),
+                platform.arch.as_str()
+            );
+            Ok(AutoUpdater::bundled_ssh_payload(&file_name, cx).await)
         })
     }
 }

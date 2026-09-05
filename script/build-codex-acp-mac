@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+    echo "Usage: ${0##*/} <target-triple> <resources-directory>" >&2
+    exit 1
+fi
+
+codex_acp_version="1.6.2"
+codex_acp_commit="9780d314d34616b476b1ae451ad31089b3dce49a"
+target_triple="$1"
+resources_dir="$2"
+workspace_root=$(git rev-parse --show-toplevel)
+
+case "$target_triple" in
+    x86_64-apple-darwin)
+        codex_package_architecture="x64"
+        ;;
+    aarch64-apple-darwin)
+        codex_package_architecture="arm64"
+        ;;
+    *)
+        echo "Unsupported macOS target: $target_triple" >&2
+        exit 1
+        ;;
+esac
+
+source_dir=$(mktemp -d)
+cleanup() {
+    rm -rf "$source_dir"
+}
+trap cleanup EXIT
+
+git clone --quiet --depth 1 --branch "v${codex_acp_version}" \
+    https://github.com/agentclientprotocol/codex-acp.git "$source_dir"
+
+actual_commit=$(git -C "$source_dir" rev-parse HEAD)
+if [[ "$actual_commit" != "$codex_acp_commit" ]]; then
+    echo "Unexpected codex-acp commit: $actual_commit" >&2
+    exit 1
+fi
+
+git -C "$source_dir" apply "$workspace_root/script/codex-acp-history.patch"
+
+pushd "$source_dir" >/dev/null
+npm ci --include=optional --os=darwin --cpu="$codex_package_architecture"
+npm run typecheck
+npm run build
+popd >/dev/null
+
+codex_binary=$(find \
+    "$source_dir/node_modules/@openai/codex-darwin-${codex_package_architecture}/vendor" \
+    -type f -path '*/bin/codex' -print -quit)
+if [[ -z "$codex_binary" ]]; then
+    echo "The native Codex binary was not installed" >&2
+    exit 1
+fi
+
+mkdir -p "$resources_dir"
+cp "$source_dir/dist/index.js" "$resources_dir/codex-acp.js"
+cp "$codex_binary" "$resources_dir/codex"
+chmod 755 "$resources_dir/codex-acp.js" "$resources_dir/codex"

@@ -94,7 +94,7 @@ use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleFavoriteThinkingEfforts,
     CycleModeSelector, CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow,
-    KeepAll, NewThread, OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce,
+    ForkThread, KeepAll, NewThread, OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce,
     RemoveFirstQueuedMessage, ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown,
     ScrollOutputPageUp, ScrollOutputToBottom, ScrollOutputToNextMessage,
     ScrollOutputToPreviousMessage, ScrollOutputToTop, SendImmediately, SendNextQueuedMessage,

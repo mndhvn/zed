@@ -3007,6 +3007,7 @@ mod tests {
 
         message_editor.read_with(&cx, |message_editor, _| {
             message_editor.set_local_commands(vec![
+                PromptLocalCommand::Fork,
                 PromptLocalCommand::ThumbsUp,
                 PromptLocalCommand::ThumbsDown,
             ]);
@@ -3024,16 +3025,14 @@ mod tests {
             })
         });
 
-        // `/helpful` would fuzzy-match both commands ("helpful" is a
-        // subsequence of "not-helpful"), so drive the unambiguous keyword.
-        cx.simulate_input("/not-helpful");
+        cx.simulate_input("/fork");
         cx.run_until_parked();
 
         editor.read_with(&cx, |editor, _| {
             assert!(editor.has_visible_completions_menu());
             assert_eq!(
                 current_completion_labels(editor),
-                &[PromptLocalCommand::ThumbsDown.label().to_string()],
+                &[PromptLocalCommand::Fork.label().to_string()],
             );
         });
 
@@ -3049,10 +3048,7 @@ mod tests {
             assert!(!editor.has_visible_completions_menu());
         });
 
-        assert_eq!(
-            invoked.borrow().as_slice(),
-            &[PromptLocalCommand::ThumbsDown],
-        );
+        assert_eq!(invoked.borrow().as_slice(), &[PromptLocalCommand::Fork],);
     }
 
     /// Opening slash-command autocomplete must emit

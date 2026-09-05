@@ -1,6 +1,6 @@
 use acp_thread::{
-    AgentConnection, AgentSessionClientUserMessageIds, AgentSessionInfo, AgentSessionList,
-    AgentSessionListRequest, AgentSessionListResponse, AgentSessionTruncate,
+    AgentConnection, AgentSessionClientUserMessageIds, AgentSessionFork, AgentSessionInfo,
+    AgentSessionList, AgentSessionListRequest, AgentSessionListResponse, AgentSessionTruncate,
     AgentSessionTruncateResponse, ClientUserMessageId, ElicitationStore,
 };
 use action_log::ActionLog;
@@ -407,6 +407,7 @@ pub struct AcpConnection {
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
     history_edit_method: Option<Arc<str>>,
+    session_fork_method: Option<Arc<str>>,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
@@ -814,6 +815,16 @@ fn history_edit_method(meta: Option<&acp::Meta>) -> Option<Arc<str>> {
     method.starts_with('_').then(|| Arc::from(method))
 }
 
+fn session_fork_method(meta: Option<&acp::Meta>) -> Option<Arc<str>> {
+    let session_forking = meta?
+        .get("codex")?
+        .as_object()?
+        .get("sessionForking")?
+        .as_object()?;
+    let method = session_forking.get("method")?.as_str()?;
+    method.starts_with('_').then(|| Arc::from(method))
+}
+
 impl AcpConnection {
     pub fn subscribe_debug_messages(
         &self,
@@ -1055,6 +1066,7 @@ impl AcpConnection {
 
         let agent_info = response.agent_info;
         let history_edit_method = history_edit_method(response.meta.as_ref());
+        let session_fork_method = session_fork_method(response.meta.as_ref());
         let telemetry_id = agent_info
             .as_ref()
             // Use the one the agent provides if we have one
@@ -1122,6 +1134,7 @@ impl AcpConnection {
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
             agent_capabilities: response.agent_capabilities,
             history_edit_method,
+            session_fork_method,
             request_elicitations,
             defaults,
             session_list,
@@ -1165,6 +1178,7 @@ impl AcpConnection {
             agent_server_store,
             agent_capabilities,
             history_edit_method: None,
+            session_fork_method: None,
             request_elicitations,
             defaults,
             child: None,
@@ -1688,6 +1702,31 @@ struct AcpSessionForkEdit {
     method: Arc<str>,
 }
 
+struct AcpSessionFork {
+    connection: ConnectionTo<Agent>,
+    session_id: acp::SessionId,
+    method: Arc<str>,
+}
+
+impl AgentSessionFork for AcpSessionFork {
+    fn run(&self, _title: SharedString, cx: &mut App) -> Task<Result<acp::SessionId>> {
+        let request = match UntypedMessage::new(
+            self.method.as_ref(),
+            serde_json::json!({ "sessionId": self.session_id }),
+        ) {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(error.into())),
+        };
+        let connection = self.connection.clone();
+
+        cx.foreground_executor().spawn(async move {
+            let response = connection.send_request(request).block_task().await?;
+            let response: ForkEditResponse = serde_json::from_value(response)?;
+            Ok(response.session_id)
+        })
+    }
+}
+
 impl AgentSessionTruncate for AcpSessionForkEdit {
     fn run(
         &self,
@@ -2111,6 +2150,16 @@ impl AgentConnection for AcpConnection {
             Rc::new(AcpSessionForkEdit {
                 connection: self.connection.clone(),
                 sessions: self.sessions.clone(),
+                session_id: session_id.clone(),
+                method: method.clone(),
+            }) as _
+        })
+    }
+
+    fn fork(&self, session_id: &acp::SessionId, _cx: &App) -> Option<Rc<dyn AgentSessionFork>> {
+        self.session_fork_method.as_ref().map(|method| {
+            Rc::new(AcpSessionFork {
+                connection: self.connection.clone(),
                 session_id: session_id.clone(),
                 method: method.clone(),
             }) as _
@@ -2842,6 +2891,37 @@ mod tests {
 
         assert!(history_edit_method(Some(&disabled)).is_none());
         assert!(history_edit_method(Some(&invalid_method)).is_none());
+    }
+
+    #[test]
+    fn parses_codex_session_fork_capability() {
+        let meta = acp::Meta::from_iter([(
+            "codex".into(),
+            serde_json::json!({
+                "sessionForking": {
+                    "method": "_session/fork"
+                }
+            }),
+        )]);
+
+        assert_eq!(
+            session_fork_method(Some(&meta)).as_deref(),
+            Some("_session/fork")
+        );
+    }
+
+    #[test]
+    fn rejects_non_extension_session_fork_method() {
+        let meta = acp::Meta::from_iter([(
+            "codex".into(),
+            serde_json::json!({
+                "sessionForking": {
+                    "method": "session/fork"
+                }
+            }),
+        )]);
+
+        assert!(session_fork_method(Some(&meta)).is_none());
     }
 
     #[gpui::test]

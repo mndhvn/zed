@@ -224,6 +224,10 @@ pub trait AgentConnection {
         None
     }
 
+    fn fork(&self, _session_id: &acp::SessionId, _cx: &App) -> Option<Rc<dyn AgentSessionFork>> {
+        None
+    }
+
     fn set_title(
         &self,
         _session_id: &acp::SessionId,
@@ -284,6 +288,10 @@ pub trait AgentSessionTruncate {
         client_user_message_id: ClientUserMessageId,
         cx: &mut App,
     ) -> Task<Result<AgentSessionTruncateResponse>>;
+}
+
+pub trait AgentSessionFork {
+    fn run(&self, title: SharedString, cx: &mut App) -> Task<Result<acp::SessionId>>;
 }
 
 pub trait AgentSessionClientUserMessageIds {

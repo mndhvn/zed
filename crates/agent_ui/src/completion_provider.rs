@@ -197,6 +197,7 @@ impl PromptContextAction {
 /// work (see `handle_message_editor_event`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptLocalCommand {
+    Fork,
     ThumbsUp,
     ThumbsDown,
 }
@@ -204,6 +205,7 @@ pub enum PromptLocalCommand {
 impl PromptLocalCommand {
     pub fn keyword(&self) -> &'static str {
         match self {
+            Self::Fork => "fork",
             Self::ThumbsUp => "helpful",
             Self::ThumbsDown => "not-helpful",
         }
@@ -211,6 +213,7 @@ impl PromptLocalCommand {
 
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Fork => "Fork Conversation",
             Self::ThumbsUp => "Positive Feedback",
             Self::ThumbsDown => "Negative Feedback",
         }
@@ -218,6 +221,7 @@ impl PromptLocalCommand {
 
     pub fn description(&self) -> &'static str {
         match self {
+            Self::Fork => "Create a new conversation from the current conversation.",
             Self::ThumbsUp => {
                 "Rate this response as helpful. Sends the current conversation to the Zed team."
             }
@@ -229,6 +233,7 @@ impl PromptLocalCommand {
 
     pub fn icon(&self) -> IconName {
         match self {
+            Self::Fork => IconName::GitBranchPlus,
             Self::ThumbsUp => IconName::ThumbsUp,
             Self::ThumbsDown => IconName::ThumbsDown,
         }

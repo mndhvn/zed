@@ -597,6 +597,12 @@ impl AutoUpdater {
         set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
         cx: &mut AsyncApp,
     ) -> Result<PathBuf> {
+        let bundled_file_name = format!("zed-remote-server-{os}-{arch}.gz");
+        if let Some(path) = Self::bundled_ssh_payload(&bundled_file_name, cx).await {
+            set_status("Using bundled remote server", cx);
+            return Ok(path);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
@@ -653,6 +659,14 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<Option<String>> {
+        let bundled_file_name = format!("zed-remote-server-{os}-{arch}.gz");
+        if Self::bundled_ssh_payload(&bundled_file_name, cx)
+            .await
+            .is_some()
+        {
+            return Ok(None);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
@@ -665,6 +679,13 @@ impl AutoUpdater {
                 .await?;
 
         Ok(Some(release.url))
+    }
+
+    pub async fn bundled_ssh_payload(file_name: &str, cx: &mut AsyncApp) -> Option<PathBuf> {
+        let app_path = cx.update(|cx| cx.app_path()).ok()?;
+        let path = app_path.join("Contents/Resources/ssh").join(file_name);
+        smol::fs::metadata(&path).await.ok()?;
+        Some(path)
     }
 
     async fn get_release_asset(

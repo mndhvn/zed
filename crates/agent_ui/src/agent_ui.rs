@@ -386,6 +386,12 @@ pub struct ToggleCommandPattern {
 #[serde(deny_unknown_fields)]
 pub struct NewThread;
 
+/// Forks the active conversation into a new thread.
+#[derive(Default, Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct ForkThread;
+
 /// Creates a new external agent conversation thread.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]

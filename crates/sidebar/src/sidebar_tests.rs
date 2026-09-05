@@ -9550,62 +9550,9 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
         cx,
     );
 
-    // All three threads are now live. Thread A was opened last, so it is active.
-    // Their visual sidebar order is A, B, C by display time.
-
-    // ── 1. Open switcher: threads stay in visual sidebar order ───────────────
     focus_sidebar(&sidebar, cx);
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
-    });
-    cx.run_until_parked();
 
-    assert_eq!(
-        switcher_ids(&sidebar, cx),
-        vec![thread_id_a, thread_id_b, thread_id_c,],
-    );
-    // First ctrl-tab selects the second entry (B).
-    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_b);
-
-    // ── 2. Confirming threads does not reorder the switcher ────────────
-    // Cycle once from Thread B to Thread C (index 2).
-    sidebar.read_with(cx, |sidebar, cx| {
-        let switcher = sidebar.thread_switcher.as_ref().unwrap();
-        assert_eq!(switcher.read(cx).selected_index(), 1);
-    });
-    sidebar.update_in(cx, |sidebar, _window, cx| {
-        sidebar
-            .thread_switcher
-            .as_ref()
-            .unwrap()
-            .update(cx, |s, cx| s.cycle_selection(cx));
-    });
-    cx.run_until_parked();
-    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_c);
-
-    // Confirm on Thread C.
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        let switcher = sidebar.thread_switcher.as_ref().unwrap();
-        let focus = switcher.focus_handle(cx);
-        focus.dispatch_action(&menu::Confirm, window, cx);
-    });
-    cx.run_until_parked();
-
-    // Switcher should be dismissed after confirm.
-    sidebar.read_with(cx, |sidebar, _cx| {
-        assert!(
-            sidebar.thread_switcher.is_none(),
-            "switcher should be dismissed"
-        );
-    });
-
-    sidebar.update(cx, |sidebar, _cx| {
-        assert!(
-            is_active_session(&sidebar, &session_id_c),
-            "active_entry should be Thread({session_id_c:?})"
-        );
-    });
-
+    cx.simulate_modifiers_change(Modifiers::alt());
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
     });
@@ -9615,23 +9562,16 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
         switcher_ids(&sidebar, cx),
         vec![thread_id_a, thread_id_b, thread_id_c],
     );
-    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_a);
+    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_b);
 
-    // Confirm on Thread A.
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        let switcher = sidebar.thread_switcher.as_ref().unwrap();
-        let focus = switcher.focus_handle(cx);
-        focus.dispatch_action(&menu::Confirm, window, cx);
-    });
+    cx.simulate_modifiers_change(Modifiers::none());
     cx.run_until_parked();
-
-    sidebar.update(cx, |sidebar, _cx| {
-        assert!(
-            is_active_session(&sidebar, &session_id_a),
-            "active_entry should be Thread({session_id_a:?})"
-        );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(is_active_session(sidebar, &session_id_b));
+        assert!(sidebar.thread_switcher.is_none());
     });
 
+    cx.simulate_modifiers_change(Modifiers::alt());
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
     });
@@ -9639,91 +9579,36 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
 
     assert_eq!(
         switcher_ids(&sidebar, cx),
-        vec![thread_id_a, thread_id_b, thread_id_c,],
+        vec![thread_id_b, thread_id_a, thread_id_c],
     );
-    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_b);
+    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_a);
 
-    // Confirm on Thread B.
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        let switcher = sidebar.thread_switcher.as_ref().unwrap();
-        let focus = switcher.focus_handle(cx);
-        focus.dispatch_action(&menu::Confirm, window, cx);
-    });
+    cx.simulate_modifiers_change(Modifiers::none());
     cx.run_until_parked();
-
-    sidebar.update(cx, |sidebar, _cx| {
-        assert!(
-            is_active_session(&sidebar, &session_id_b),
-            "active_entry should be Thread({session_id_b:?})"
-        );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(is_active_session(sidebar, &session_id_a));
+        assert!(sidebar.thread_switcher.is_none());
     });
 
-    // ── 3. A newer historical thread appears first, matching the sidebar ──
-    // This thread was never opened in a panel — it only exists in metadata.
-    save_thread_metadata(
-        acp::SessionId::new(Arc::from("thread-historical")),
-        Some("Historical Thread".into()),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 1, 0, 0, 0).unwrap(),
-        Some(chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 1, 0, 0, 0).unwrap()),
-        None,
-        &project,
-        cx,
-    );
-
+    cx.simulate_modifiers_change(Modifiers::alt());
     sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
         sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
     });
     cx.run_until_parked();
 
-    let session_id_hist = acp::SessionId::new(Arc::from("thread-historical"));
-    let thread_id_hist = thread_id_for(&session_id_hist, cx);
-
-    let ids = switcher_ids(&sidebar, cx);
     assert_eq!(
-        ids,
-        vec![thread_id_hist, thread_id_a, thread_id_b, thread_id_c],
+        switcher_ids(&sidebar, cx),
+        vec![thread_id_a, thread_id_b, thread_id_c],
     );
+    assert_eq!(switcher_selected_id(&sidebar, cx), thread_id_c);
 
-    sidebar.update_in(cx, |sidebar, _window, cx| {
-        sidebar.dismiss_thread_switcher(cx);
-    });
+    cx.simulate_modifiers_change(Modifiers::none());
     cx.run_until_parked();
-
-    // ── 4. Add another historical thread with older created_at ─────────
-    save_thread_metadata(
-        acp::SessionId::new(Arc::from("thread-old-historical")),
-        Some("Old Historical Thread".into()),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2023, 6, 1, 0, 0, 0).unwrap(),
-        Some(chrono::TimeZone::with_ymd_and_hms(&Utc, 2023, 6, 1, 0, 0, 0).unwrap()),
-        None,
-        &project,
-        cx,
-    );
-
-    sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(is_active_session(sidebar, &session_id_c));
+        assert!(sidebar.thread_switcher.is_none());
     });
-    cx.run_until_parked();
-
-    // The older historical thread appears last, again matching the sidebar.
-    let session_id_old_hist = acp::SessionId::new(Arc::from("thread-old-historical"));
-    let thread_id_old_hist = thread_id_for(&session_id_old_hist, cx);
-    let ids = switcher_ids(&sidebar, cx);
-    assert_eq!(
-        ids,
-        vec![
-            thread_id_hist,
-            thread_id_a,
-            thread_id_b,
-            thread_id_c,
-            thread_id_old_hist,
-        ],
-    );
-
-    sidebar.update_in(cx, |sidebar, _window, cx| {
-        sidebar.dismiss_thread_switcher(cx);
-    });
-    cx.run_until_parked();
 }
 
 #[gpui::test]

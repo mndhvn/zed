@@ -106,6 +106,20 @@ mv Cargo.toml.backup Cargo.toml
 popd
 echo "Bundled ${app_path}"
 
+codex_resources="${app_path}/Contents/Resources/codex"
+script/build-codex-acp-mac "$target_triple" "$codex_resources"
+
+ssh_resources="${app_path}/Contents/Resources/ssh"
+ssh_payloads_dir="target/ssh-payloads"
+if [[ -d "$ssh_payloads_dir" ]]; then
+    mkdir -p "$ssh_resources"
+    for payload_archive in "$ssh_payloads_dir"/*.tar.gz; do
+        if [[ -f "$payload_archive" ]]; then
+            tar -xzf "$payload_archive" -C "$ssh_resources"
+        fi
+    done
+fi
+
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.
 document_icon_source="crates/zed/resources/Document.icns"

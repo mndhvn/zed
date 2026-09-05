@@ -45,8 +45,8 @@ use crate::terminal_thread_metadata_store::{
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
-    Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
+    Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, ForkThread,
+    NewExternalAgentThread, NewNativeAgentThreadFromSummary,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
@@ -378,6 +378,12 @@ pub fn init(cx: &mut App) {
                         panel.update(cx, |panel, cx| {
                             panel.new_thread_with_workspace(Some(workspace), window, cx)
                         });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, action: &ForkThread, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.fork_active_thread(action, window, cx));
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     }
                 })
@@ -1782,6 +1788,92 @@ impl AgentPanel {
         }
 
         self.new_thread_with_workspace(None, window, cx);
+    }
+
+    fn can_fork_active_thread(&self, cx: &App) -> bool {
+        self.active_conversation_view()
+            .and_then(|conversation| conversation.read(cx).root_thread_view())
+            .is_some_and(|thread_view| {
+                let thread_view = thread_view.read(cx);
+                let thread = thread_view.thread.read(cx);
+                !thread.entries().is_empty()
+                    && thread.status() == ThreadStatus::Idle
+                    && thread.supports_fork(cx)
+            })
+    }
+
+    fn fork_active_thread(
+        &mut self,
+        _action: &ForkThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let Some(conversation) = self.active_conversation_view().cloned() else {
+            return;
+        };
+        let Some(thread_view) = conversation.read(cx).root_thread_view() else {
+            return;
+        };
+        let thread = thread_view.read(cx).thread.clone();
+        let (fork, work_dirs) = {
+            let thread = thread.read(cx);
+            if thread.status() != ThreadStatus::Idle {
+                return;
+            }
+            if thread.entries().is_empty() {
+                return;
+            }
+            let Some(fork) = thread.connection().fork(thread.session_id(), cx) else {
+                return;
+            };
+            (fork, thread.work_dirs().cloned())
+        };
+        let agent = conversation.read(cx).agent_key().clone();
+        let title: SharedString = format!("{} (Fork)", conversation.read(cx).title(cx)).into();
+        let fork_task = fork.run(title.clone(), cx);
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            match fork_task.await {
+                Ok(session_id) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.external_thread_by_session(
+                            agent,
+                            session_id,
+                            work_dirs,
+                            Some(title),
+                            true,
+                            AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        );
+                    })?;
+                }
+                Err(error) => {
+                    let message = format!("Failed to fork conversation: {error:#}");
+                    cx.update(|_window, cx| {
+                        if let Some(workspace) = workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                struct ForkThreadToast;
+                                workspace.show_toast(
+                                    workspace::Toast::new(
+                                        workspace::notifications::NotificationId::unique::<
+                                            ForkThreadToast,
+                                        >(),
+                                        message,
+                                    )
+                                    .autohide(),
+                                    cx,
+                                );
+                            });
+                        }
+                    })?;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn new_thread_with_workspace(
@@ -5846,6 +5938,7 @@ impl AgentPanel {
         let focus_handle = self.focus_handle(cx);
 
         let can_create_entries = self.has_open_project(cx);
+        let can_fork_thread = self.can_fork_active_thread(cx);
         let supports_terminal = self.supports_terminal(cx);
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
 
@@ -6148,6 +6241,7 @@ impl AgentPanel {
         });
 
         let toolbar_content = {
+            let new_thread_focus_handle = focus_handle.clone();
             let new_thread_menu = PopoverMenu::new("new_thread_menu")
                 .trigger_with_tooltip(
                     IconButton::new("new_thread_menu_btn", IconName::Plus)
@@ -6157,7 +6251,7 @@ impl AgentPanel {
                             Tooltip::for_action_in(
                                 "New Thread\u{2026}",
                                 &ToggleNewThreadMenu,
-                                &focus_handle,
+                                &new_thread_focus_handle,
                                 cx,
                             )
                         }
@@ -6166,6 +6260,15 @@ impl AgentPanel {
                 .anchor(Anchor::TopRight)
                 .with_handle(self.new_thread_menu_handle.clone())
                 .menu(move |window, cx| new_thread_menu_builder(window, cx));
+
+            let fork_thread_button = IconButton::new("fork-thread", IconName::GitBranchPlus)
+                .icon_size(IconSize::Small)
+                .tooltip(move |_window, cx| {
+                    Tooltip::for_action_in("Fork Conversation", &ForkThread, &focus_handle, cx)
+                })
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(ForkThread.boxed_clone(), cx);
+                });
 
             let sandbox_status = self
                 .active_conversation_view()
@@ -6197,6 +6300,7 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
+                        .when(can_fork_thread, |this| this.child(fork_thread_button))
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
@@ -6515,6 +6619,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(|this, action: &NewThread, window, cx| {
                 this.new_thread(action, window, cx);
             }))
+            .on_action(cx.listener(Self::fork_active_thread))
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
                 cx.stop_propagation();
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);

@@ -15,13 +15,17 @@ use gh_workflow::*;
 use indoc::indoc;
 
 pub fn run_bundling() -> Workflow {
+    let linux_aarch64 = bundle_linux(Arch::AARCH64, None, &[]);
+    let linux_x86_64 = bundle_linux(Arch::X86_64, None, &[]);
+    let mac_aarch64 = bundle_mac(Arch::AARCH64, None, &[&linux_aarch64, &linux_x86_64]);
+    let mac_x86_64 = bundle_mac(Arch::X86_64, None, &[&linux_aarch64, &linux_x86_64]);
     let bundle = ReleaseBundleJobs {
-        linux_aarch64: bundle_linux(Arch::AARCH64, None, &[]),
-        linux_x86_64: bundle_linux(Arch::X86_64, None, &[]),
+        linux_aarch64,
+        linux_x86_64,
         bwrap_linux_aarch64: build_static_bwrap(Arch::AARCH64, &[]),
         bwrap_linux_x86_64: build_static_bwrap(Arch::X86_64, &[]),
-        mac_aarch64: bundle_mac(Arch::AARCH64, None, &[]),
-        mac_x86_64: bundle_mac(Arch::X86_64, None, &[]),
+        mac_aarch64,
+        mac_x86_64,
         windows_aarch64: bundle_windows(Arch::AARCH64, None, &[]),
         windows_x86_64: bundle_windows(Arch::X86_64, None, &[]),
     };
@@ -74,6 +78,10 @@ pub(crate) fn bundle_mac(
         Arch::X86_64 => assets::REMOTE_SERVER_MAC_X86_64,
         Arch::AARCH64 => assets::REMOTE_SERVER_MAC_AARCH64,
     };
+    let ssh_payloads = [
+        assets::SSH_PAYLOADS_LINUX_AARCH64,
+        assets::SSH_PAYLOADS_LINUX_X86_64,
+    ];
     NamedJob {
         name: format!("bundle_mac_{arch}"),
         job: bundle_job(deps)
@@ -81,6 +89,16 @@ pub(crate) fn bundle_mac(
             .envs(bundle_envs(platform))
             .add_step(steps::checkout_repo())
             .add_step(steps::cache_rust_dependencies_namespace())
+            .map(|mut job| {
+                for payload in ssh_payloads {
+                    job = job.add_step(
+                        steps::download_artifact()
+                            .artifact_name(payload)
+                            .path("target/ssh-payloads"),
+                    );
+                }
+                job
+            })
             .when_some(release_channel, |job, release_channel| {
                 job.add_step(set_release_channel(platform, release_channel))
             })
@@ -169,15 +187,24 @@ pub(crate) fn bundle_linux(
             .add_env(Env::new("CXX", "clang++-18"))
             .add_step(steps::checkout_repo())
             .add_step(steps::cache_rust_dependencies_namespace())
+            .add_step(steps::setup_node())
             .when_some(release_channel, |job, release_channel| {
                 job.add_step(set_release_channel(platform, release_channel))
             })
             .add_step(steps::setup_sentry())
             .map(steps::install_linux_dependencies)
             .add_step(steps::script("./script/bundle-linux"))
+            .add_step(steps::script("./script/build-codex-acp-linux"))
             .add_step(upload_artifact(&format!("target/release/{artifact_name}")))
             .add_step(upload_artifact(&format!(
                 "target/{remote_server_artifact_name}"
+            )))
+            .add_step(upload_artifact(&format!(
+                "target/{}",
+                match arch {
+                    Arch::X86_64 => assets::SSH_PAYLOADS_LINUX_X86_64,
+                    Arch::AARCH64 => assets::SSH_PAYLOADS_LINUX_AARCH64,
+                }
             ))),
     }
 }

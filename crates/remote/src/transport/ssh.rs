@@ -1,5 +1,5 @@
 use crate::{
-    RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
+    RemoteArch, RemoteClientDelegate, RemoteOs, RemotePayload, RemotePlatform,
     remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
     transport::{parse_platform, parse_shell},
 };
@@ -46,6 +46,8 @@ pub(crate) struct SshRemoteConnection {
     /// reused ControlMaster sessions start with `master_process` as `None`.
     killed: AtomicBool,
     remote_binary_path: Option<Arc<RelPath>>,
+    remote_codex_acp_path: Option<Arc<RelPath>>,
+    remote_codex_path: Option<Arc<RelPath>>,
     ssh_platform: RemotePlatform,
     ssh_os_version: Option<String>,
     ssh_path_style: PathStyle,
@@ -503,6 +505,18 @@ impl RemoteConnection for SshRemoteConnection {
                     proxy_args.push(format!("{env_var}={value}"));
                 }
             }
+            if let Some(codex_acp_path) = &self.remote_codex_acp_path {
+                proxy_args.push(format!(
+                    "ZED_BUNDLED_CODEX_ACP_PATH={}",
+                    codex_acp_path.display(self.path_style())
+                ));
+            }
+            if let Some(codex_path) = &self.remote_codex_path {
+                proxy_args.push(format!(
+                    "ZED_BUNDLED_CODEX_PATH={}",
+                    codex_path.display(self.path_style())
+                ));
+            }
             proxy_args.push(remote_binary_path.display(self.path_style()).into_owned());
             proxy_args.push("proxy".to_owned());
             proxy_args.push("--identifier".to_owned());
@@ -812,6 +826,8 @@ impl SshRemoteConnection {
             killed: AtomicBool::new(false),
             _temp_dir: temp_dir,
             remote_binary_path: None,
+            remote_codex_acp_path: None,
+            remote_codex_path: None,
             ssh_path_style,
             ssh_platform,
             ssh_os_version,
@@ -823,11 +839,97 @@ impl SshRemoteConnection {
         let (release_channel, version) =
             cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
         this.remote_binary_path = Some(
-            this.ensure_server_binary(&delegate, release_channel, version, cx)
+            this.ensure_server_binary(&delegate, release_channel, version.clone(), cx)
                 .await?,
         );
+        if this.ssh_platform.os == RemoteOs::Linux {
+            let codex_acp_path = this
+                .ensure_remote_payload(
+                    &delegate,
+                    RemotePayload::CodexAcp,
+                    release_channel,
+                    &version,
+                    cx,
+                )
+                .await?;
+            let codex_path = this
+                .ensure_remote_payload(
+                    &delegate,
+                    RemotePayload::Codex,
+                    release_channel,
+                    &version,
+                    cx,
+                )
+                .await?;
+            match (codex_acp_path, codex_path) {
+                (Some(codex_acp_path), Some(codex_path)) => {
+                    this.remote_codex_acp_path = Some(codex_acp_path);
+                    this.remote_codex_path = Some(codex_path);
+                }
+                (None, None) => {}
+                _ => anyhow::bail!("bundled Codex ACP payload is incomplete"),
+            }
+        }
 
         Ok(this)
+    }
+
+    async fn ensure_remote_payload(
+        &self,
+        delegate: &Arc<dyn RemoteClientDelegate>,
+        payload: RemotePayload,
+        release_channel: ReleaseChannel,
+        version: &Version,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<Arc<RelPath>>> {
+        let Some(source_path) = delegate
+            .bundled_remote_payload(self.ssh_platform, payload, cx)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let version = version.to_string();
+        let (component, extension) = match payload {
+            RemotePayload::CodexAcp => ("zed-codex-acp", ".js"),
+            RemotePayload::Codex => ("zed-codex", ""),
+        };
+        let file_name = format!(
+            "{component}-{}-{version}{extension}",
+            release_channel.dev_name()
+        );
+        let relative_file_name = RelPath::from_unix_str(&file_name)
+            .with_context(|| format!("invalid remote payload file name {file_name}"))?;
+        let destination_path = remote_server_dir_relative().join(relative_file_name);
+
+        let destination_display = destination_path.display(self.path_style());
+        if self
+            .socket
+            .run_command(
+                self.ssh_shell_kind,
+                "test",
+                &["-f", destination_display.as_ref()],
+                true,
+            )
+            .await
+            .is_ok()
+        {
+            return Ok(Some(destination_path.into()));
+        }
+
+        let temporary_file_name = format!("{file_name}-download-{}.gz", std::process::id());
+        let temporary_file_name =
+            RelPath::from_unix_str(&temporary_file_name).with_context(|| {
+                format!("invalid temporary payload file name {temporary_file_name}")
+            })?;
+        let temporary_path = remote_server_dir_relative().join(temporary_file_name);
+        self.upload_local_server_binary(&source_path, &temporary_path, delegate, cx)
+            .await
+            .context("uploading bundled remote payload")?;
+        self.extract_server_binary(&destination_path, &temporary_path, delegate, cx)
+            .await
+            .context("extracting bundled remote payload")?;
+        Ok(Some(destination_path.into()))
     }
 
     async fn ensure_server_binary(
@@ -837,8 +939,11 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
-        let version_str = match release_channel {
-            ReleaseChannel::Dev => "build".to_string(),
+        let bundled_server_binary = delegate
+            .bundled_remote_server_binary(self.ssh_platform, cx)
+            .await?;
+        let version_str = match (release_channel, bundled_server_binary.is_some()) {
+            (ReleaseChannel::Dev, false) => "build".to_string(),
             _ => version.to_string(),
         };
         let binary_name = format!(
@@ -893,17 +998,6 @@ impl SshRemoteConnection {
             return Ok(dst_path.into());
         }
 
-        let wanted_version = cx.update(|cx| match release_channel {
-            ReleaseChannel::Nightly => Ok(None),
-            ReleaseChannel::Dev => {
-                anyhow::bail!(
-                    "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
-                    dst_path
-                )
-            }
-            _ => Ok(Some(AppVersion::global(cx))),
-        })?;
-
         let tmp_path_compressed = remote_server_dir_relative().join(
             RelPath::from_unix_str(&format!(
                 "{}-download-{}.{}",
@@ -915,8 +1009,29 @@ impl SshRemoteConnection {
                     "gz"
                 }
             ))
-            .unwrap(),
+            .context("invalid temporary remote server path")?,
         );
+        if let Some(source_path) = bundled_server_binary {
+            self.upload_local_server_binary(&source_path, &tmp_path_compressed, delegate, cx)
+                .await
+                .context("uploading bundled server binary")?;
+            self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
+                .await
+                .context("extracting bundled server binary")?;
+            return Ok(dst_path.into());
+        }
+
+        let wanted_version = cx.update(|cx| match release_channel {
+            ReleaseChannel::Nightly => Ok(None),
+            ReleaseChannel::Dev => {
+                anyhow::bail!(
+                    "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
+                    dst_path
+                )
+            }
+            _ => Ok(Some(AppVersion::global(cx))),
+        })?;
+
         if !self.socket.connection_options.upload_binary_over_ssh
             && let Some(url) = delegate
                 .get_download_url(

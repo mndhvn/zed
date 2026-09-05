@@ -116,6 +116,30 @@ pub struct RemotePlatform {
     pub arch: RemoteArch,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RemotePayload {
+    CodexAcp,
+    Codex,
+}
+
+impl RemotePayload {
+    pub fn file_name(self, platform: RemotePlatform) -> String {
+        let component = match self {
+            Self::CodexAcp => "zed-codex-acp",
+            Self::Codex => "zed-codex",
+        };
+        let extension = match self {
+            Self::CodexAcp => ".js.gz",
+            Self::Codex => ".gz",
+        };
+        format!(
+            "{component}-{}-{}{extension}",
+            platform.os.as_str(),
+            platform.arch.as_str()
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CommandTemplate {
     pub program: String,
@@ -154,6 +178,21 @@ pub trait RemoteClientDelegate: Send + Sync {
         version: Option<Version>,
         cx: &mut AsyncApp,
     ) -> Task<Result<PathBuf>>;
+    fn bundled_remote_server_binary(
+        &self,
+        _platform: RemotePlatform,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<Option<PathBuf>>> {
+        Task::ready(Ok(None))
+    }
+    fn bundled_remote_payload(
+        &self,
+        _platform: RemotePlatform,
+        _payload: RemotePayload,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<Option<PathBuf>>> {
+        Task::ready(Ok(None))
+    }
     fn set_status(&self, status: Option<&str>, cx: &mut AsyncApp);
 }
 
