@@ -198,6 +198,7 @@ impl From<anyhow::Error> for ThreadError {
                         provider: provider.to_string().into(),
                     },
                     ProviderErrorCategory::InvalidEncryptedContent
+                    | ProviderErrorCategory::ContentPolicy
                     | ProviderErrorCategory::InvalidRequest
                     | ProviderErrorCategory::Conflict
                     | ProviderErrorCategory::Timeout
@@ -998,6 +999,15 @@ impl ConversationView {
     fn request_elicitation_store(&self) -> Option<Entity<ElicitationStore>> {
         self.request_elicitation_connection()?
             .request_elicitations()
+    }
+
+    /// Drops the cached connection for this agent (so the next request spawns a
+    /// fresh server process) and rebuilds the thread state from scratch.
+    pub(crate) fn retry_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connection_store.update(cx, |store, cx| {
+            store.restart_connection(self.connection_key.clone(), self.agent.clone(), cx);
+        });
+        self.reset(window, cx);
     }
 
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2763,7 +2773,7 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (title, message, action_slot): (_, SharedString, _) = match e {
+        let (title, message) = match e {
             LoadError::Unsupported {
                 command: path,
                 current_version,
@@ -2771,35 +2781,36 @@ impl ConversationView {
             } => {
                 return self.render_unsupported(path, current_version, minimum_version, window, cx);
             }
-            LoadError::FailedToInstall(msg) => (
-                "Failed to Install",
-                msg.into(),
-                Some(self.create_copy_button(msg.to_string()).into_any_element()),
-            ),
+            LoadError::FailedToInstall(msg) => ("Failed to Install", msg.to_string()),
             LoadError::Exited { status, stderr } => {
                 let mut message = format!("Server exited with status {status}");
                 if let Some(stderr) = stderr {
                     message.push_str("\n");
                     message.push_str(stderr);
                 };
-                let action_slot = stderr
-                    .is_some()
-                    .then(|| self.create_copy_button(message.clone()).into_any_element());
-                ("Failed to Launch", message.into(), action_slot)
+                ("Failed to Launch", message)
             }
-            LoadError::Other(msg) => (
-                "Failed to Launch",
-                msg.into(),
-                Some(self.create_copy_button(msg.to_string()).into_any_element()),
-            ),
+            LoadError::Other(msg) => ("Failed to Launch", msg.to_string()),
         };
+
+        let action_slot = h_flex()
+            .gap_1()
+            .child(
+                Button::new("retry-agent-launch", "Retry")
+                    .tooltip(Tooltip::text("Try to restart the agent"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.retry_connection(window, cx);
+                    })),
+            )
+            .child(self.create_copy_button(message.clone()))
+            .into_any_element();
 
         Callout::new()
             .severity(Severity::Error)
             .icon(IconName::XCircleFilled)
             .title(title)
             .description(message)
-            .actions_slot(div().children(action_slot))
+            .actions_slot(action_slot)
             .into_any_element()
     }
 
@@ -4360,10 +4371,12 @@ pub(crate) mod tests {
                 "Conversation should transition to LoadError when an ACP thread exits"
             );
         });
+
+        release_dropped_entities(cx);
         assert_eq!(
             close_session_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "ConversationView should close the ACP session after a thread exit"
+            "dropping the thread views after a thread exit should close the ACP session"
         );
     }
 
@@ -6706,6 +6719,11 @@ pub(crate) mod tests {
     ) -> Entity<MessageEditor> {
         let thread = active_thread(conversation_view, cx);
         cx.read(|cx| thread.read(cx).message_editor.clone())
+    }
+
+    fn release_dropped_entities(cx: &mut VisualTestContext) {
+        cx.update(|_, _| ());
+        cx.run_until_parked();
     }
 
     #[gpui::test]
