@@ -1,8 +1,8 @@
 diff --git a/src/AcpExtensions.ts b/src/AcpExtensions.ts
-index a469d51..a2d36b5 100644
+index b450c8b..34f9b46 100644
 --- a/src/AcpExtensions.ts
 +++ b/src/AcpExtensions.ts
-@@ -26,6 +26,8 @@ export {
+@@ -41,6 +41,8 @@ export {
  
  export const LEGACY_SET_SESSION_MODEL_METHOD = "session/set_model";
  export const SESSION_STEERING_METHOD = "_session/steering";
@@ -11,27 +11,25 @@ index a469d51..a2d36b5 100644
  
  export type LegacySessionModel = {
      modelId: string;
-@@ -62,6 +64,8 @@ export type ExtMethodRequest =
+@@ -77,6 +79,8 @@ export type ExtMethodRequest =
      | AuthenticationLogoutRequest
      | LegacySetSessionModelExtRequest
      | SessionSteeringExtRequest
 +    | HistoryEditExtRequest
 +    | SessionForkExtRequest
      | GoalControlExtRequest
+     | AsyncTaskStopExtRequest
  
- export function isExtMethodRequest(request: { method: string, params: Record<string, unknown> }): request is ExtMethodRequest {
-@@ -70,7 +74,9 @@ export function isExtMethodRequest(request: { method: string, params: Record<str
-         || request.method === LEGACY_SET_SESSION_MODEL_METHOD
+@@ -87,6 +91,8 @@ export function isExtMethodRequest(request: { method: string, params: Record<str
          || request.method === GOAL_CONTROL_METHOD
          || request.method === LEGACY_GOAL_CONTROL_METHOD
--        || request.method === SESSION_STEERING_METHOD;
-+        || request.method === SESSION_STEERING_METHOD
+         || request.method === SESSION_STEERING_METHOD
 +        || request.method === HISTORY_EDIT_METHOD
-+        || request.method === SESSION_FORK_METHOD;
++        || request.method === SESSION_FORK_METHOD
+         || request.method === ASYNC_TASK_STOP_METHOD;
  }
  
- export type AuthenticationStatusRequest = { method: "authentication/status", params: {} }
-@@ -110,6 +116,33 @@ export type SessionSteeringExtRequest = {
+@@ -133,6 +139,33 @@ export type SessionSteeringExtRequest = {
      params: SessionSteerRequest;
  }
  
@@ -66,10 +64,10 @@ index a469d51..a2d36b5 100644
      connection: Pick<ClientContext, "request">,
      params: SessionSteerRequest,
 diff --git a/src/CodexAcpClient.ts b/src/CodexAcpClient.ts
-index 4e7f2aa..4fd4fdb 100644
+index f9995a9..a3e1818 100644
 --- a/src/CodexAcpClient.ts
 +++ b/src/CodexAcpClient.ts
-@@ -520,6 +520,89 @@ export class CodexAcpClient {
+@@ -628,6 +628,89 @@ export class CodexAcpClient {
          };
      }
  
@@ -122,7 +120,7 @@ index 4e7f2aa..4fd4fdb 100644
 +        return response.thread.id;
 +    }
 +
-+    async forkSession(
++    async forkSessionForZed(
 +        sessionId: string,
 +        cwd: string,
 +        additionalDirectories: string[],
@@ -159,7 +157,7 @@ index 4e7f2aa..4fd4fdb 100644
      async closeSession(sessionId: string): Promise<void> {
          try {
              await this.codexClient.threadUnsubscribe({threadId: sessionId});
-@@ -838,8 +921,10 @@ export class CodexAcpClient {
+@@ -945,8 +1028,10 @@ export class CodexAcpClient {
          if (shouldCancel?.()) {
              return null;
          }
@@ -169,8 +167,8 @@ index 4e7f2aa..4fd4fdb 100644
 +            ...(clientUserMessageId !== null ? {clientUserMessageId} : {}),
              input: input,
              approvalPolicy: agentMode.approvalPolicy,
-             sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
-@@ -1345,6 +1430,19 @@ function readAdditionalDirectories(cwd: string, additionalDirectories?: string[]
+             approvalsReviewer: agentMode.approvalsReviewer,
+@@ -1441,6 +1526,19 @@ function readAdditionalDirectories(cwd: string, additionalDirectories?: string[]
      return directories;
  }
  
@@ -191,10 +189,10 @@ index 4e7f2aa..4fd4fdb 100644
      if (roots.length === 0) {
          return config;
 diff --git a/src/CodexAcpServer.ts b/src/CodexAcpServer.ts
-index 6e0c394..fdc37d2 100644
+index 4dc15e0..4acdd5a 100644
 --- a/src/CodexAcpServer.ts
 +++ b/src/CodexAcpServer.ts
-@@ -48,9 +48,11 @@ import {
+@@ -67,9 +67,11 @@ import {
      GOAL_CONTROL_ACTIONS,
      GOAL_CONTROL_METHOD,
      GOAL_EXTENSION_VERSION,
@@ -206,7 +204,7 @@ index 6e0c394..fdc37d2 100644
      type LegacyLoadSessionResponse,
      type LegacyNewSessionResponse,
      type LegacyResumeSessionResponse,
-@@ -350,6 +352,15 @@ export class CodexAcpServer {
+@@ -389,6 +391,15 @@ export class CodexAcpServer {
                      controlMethod: GOAL_CONTROL_METHOD,
                      actions: [...GOAL_CONTROL_ACTIONS],
                  },
@@ -222,18 +220,18 @@ index 6e0c394..fdc37d2 100644
                  [JETBRAINS_META_KEY]: {
                      [AIR_META_KEY]: {
                          [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
-@@ -379,6 +390,10 @@ export class CodexAcpServer {
+@@ -418,6 +429,10 @@ export class CodexAcpServer {
+             }
+             case LEGACY_SET_SESSION_MODEL_METHOD:
                  return await this.unstable_setSessionModel(this.parseLegacySetSessionModelParams(methodRequest.params));
-             case SESSION_STEERING_METHOD:
-                 return await this.executeOrQueueSteeringRequest(this.parseSessionSteerParams(methodRequest.params));
 +            case HISTORY_EDIT_METHOD:
 +                return await this.forkEditedHistory(methodRequest.params);
 +            case SESSION_FORK_METHOD:
-+                return await this.forkSession(methodRequest.params);
-             case GOAL_CONTROL_METHOD:
-             case LEGACY_GOAL_CONTROL_METHOD: {
-                 const sessionState = this.sessions.get(methodRequest.params.sessionId);
-@@ -442,6 +457,75 @@ export class CodexAcpServer {
++                return await this.forkSessionForZed(methodRequest.params);
+             case SESSION_STEERING_METHOD:
+                 return await this.executeOrQueueSteeringRequest(this.parseSessionSteerParams(methodRequest.params));
+             case ASYNC_TASK_STOP_METHOD: {
+@@ -495,6 +510,75 @@ export class CodexAcpServer {
          }
      }
  
@@ -273,7 +271,7 @@ index 6e0c394..fdc37d2 100644
 +        return {sessionId: newSessionId};
 +    }
 +
-+    private async forkSession(params: {sessionId: string}): Promise<{sessionId: string}> {
++    private async forkSessionForZed(params: {sessionId: string}): Promise<{sessionId: string}> {
 +        if (this.providerUpdate !== null) {
 +            await this.providerUpdate;
 +        }
@@ -283,7 +281,7 @@ index 6e0c394..fdc37d2 100644
 +        }
 +
 +        const newSessionId = await this.runWithProcessCheck(() =>
-+            this.codexAcpClient.forkSession(
++            this.codexAcpClient.forkSessionForZed(
 +                params.sessionId,
 +                sessionState.cwd,
 +                sessionState.additionalDirectories,
@@ -309,7 +307,7 @@ index 6e0c394..fdc37d2 100644
      async checkAuthorization(){
          const authNeeded = await this.runWithProcessCheck(() => this.codexAcpClient.authRequired());
          logger.log("Auth requirement checked", {authRequired: authNeeded});
-@@ -1836,10 +1920,13 @@ export class CodexAcpServer {
+@@ -2283,10 +2367,13 @@ export class CodexAcpServer {
      private createUserMessageUpdates(item: ThreadItem & { type: "userMessage" }): UpdateSessionEvent[] {
          const updates: UpdateSessionEvent[] = [];
          const messageId = item.id;
@@ -324,24 +322,134 @@ index 6e0c394..fdc37d2 100644
              }
          }
          return updates;
+diff --git a/src/__tests__/CodexACPAgent/initialize.test.ts b/src/__tests__/CodexACPAgent/initialize.test.ts
+index 7fff772..e69c61b 100644
+--- a/src/__tests__/CodexACPAgent/initialize.test.ts
++++ b/src/__tests__/CodexACPAgent/initialize.test.ts
+@@ -75,6 +75,10 @@ describe('CodexACPAgent - initialize', () => {
+                     controlMethod: "_session/goal",
+                     actions: ["set", "pause", "resume", "clear"],
+                 },
++                codex: {
++                    historyEditing: {clientUserMessageIds: true, method: "_session/fork_edit"},
++                    sessionForking: {method: "_session/fork"},
++                },
+                 jetbrains: {
+                     air: {
+                         version: 1,
+diff --git a/src/__tests__/CodexACPAgent/session-fork.test.ts b/src/__tests__/CodexACPAgent/session-fork.test.ts
+index cf3771d..e71f8be 100644
+--- a/src/__tests__/CodexACPAgent/session-fork.test.ts
++++ b/src/__tests__/CodexACPAgent/session-fork.test.ts
+@@ -1,5 +1,5 @@
+ import {describe, expect, it, vi} from "vitest";
+-import {createCodexMockTestFixture, createTestModel} from "../acp-test-utils";
++import {createCodexMockTestFixture, createTestModel, createTestSessionState} from "../acp-test-utils";
+
+ describe("ACP session fork", () => {
+     it("creates and installs a forked session", async () => {
+@@ -44,3 +44,85 @@ describe("ACP session fork", () => {
+         });
+     });
+ });
++
++
++describe("Zed fork compatibility", () => {
++    function setupHistory() {
++        const fixture = createCodexMockTestFixture();
++        const client = fixture.getCodexAcpClient();
++        const appServer = fixture.getCodexAppServerClient();
++        vi.spyOn(client, "listSkills").mockResolvedValue({data: []});
++        vi.spyOn(appServer, "threadRead").mockResolvedValue({thread: {
++            id: "source-id",
++            turns: [
++                {id: "first-turn", items: [{type: "userMessage", clientId: "first-message"}]},
++                {id: "second-turn", items: [{type: "userMessage", clientId: "second-message"}]},
++            ],
++        }} as Awaited<ReturnType<typeof appServer.threadRead>>);
++        const fork = vi.spyOn(appServer, "threadFork").mockResolvedValue({
++            thread: {id: "fork-id"},
++        } as Awaited<ReturnType<typeof appServer.threadFork>>);
++        const start = vi.spyOn(appServer, "threadStart").mockResolvedValue({
++            thread: {id: "new-id"},
++        } as Awaited<ReturnType<typeof appServer.threadStart>>);
++        return {fixture, client, fork, start};
++    }
++
++    it("excludes the edited message and later history from the fork", async () => {
++        const {client, fork, start} = setupHistory();
++        const sessionId = await client.forkSessionBeforeClientMessage(
++            "source-id", "second-message", "/workspace", [], [], "openai",
++        );
++        expect(sessionId).toBe("fork-id");
++        expect(fork).toHaveBeenCalledWith(expect.objectContaining({
++            threadId: "source-id", lastTurnId: "first-turn", cwd: "/workspace",
++        }));
++        expect(start).not.toHaveBeenCalled();
++    });
++
++    it("starts an empty history when editing the first message", async () => {
++        const {client, fork, start} = setupHistory();
++        expect(await client.forkSessionBeforeClientMessage(
++            "source-id", "first-message", "/workspace", [], [], "openai",
++        )).toBe("new-id");
++        expect(start).toHaveBeenCalledWith(expect.objectContaining({cwd: "/workspace"}));
++        expect(fork).not.toHaveBeenCalled();
++    });
++
++    it("rejects an unknown message without creating a session", async () => {
++        const {client, fork, start} = setupHistory();
++        await expect(client.forkSessionBeforeClientMessage(
++            "source-id", "missing-message", "/workspace", [], [], "openai",
++        )).rejects.toThrow("No Codex turn found");
++        expect(fork).not.toHaveBeenCalled();
++        expect(start).not.toHaveBeenCalled();
++    });
++
++    it("preserves the full source history through Zed's existing fork command", async () => {
++        const {fixture, fork} = setupHistory();
++        const agent = fixture.getCodexAcpAgent();
++        const source = createTestSessionState({sessionId: "source-id", cwd: "/workspace"});
++        vi.spyOn(agent, "getSessionState").mockReturnValue(source);
++        expect(await agent.extMethod("_session/fork", {sessionId: "source-id"}))
++            .toEqual({sessionId: "fork-id"});
++        expect(fork).toHaveBeenCalledWith(expect.objectContaining({
++            threadId: "source-id", lastTurnId: "second-turn",
++        }));
++        expect(source.sessionId).toBe("source-id");
++    });
++
++    it("rejects history edits and forks while a turn is active", async () => {
++        const {fixture, fork, start} = setupHistory();
++        const agent = fixture.getCodexAcpAgent();
++        vi.spyOn(agent, "getSessionState").mockReturnValue(createTestSessionState({
++            sessionId: "source-id", currentTurnId: "active-turn",
++        }));
++        await expect(agent.extMethod("_session/fork", {sessionId: "source-id"}))
++            .rejects.toThrow("Invalid request");
++        await expect(agent.extMethod("_session/fork_edit", {
++            sessionId: "source-id", clientUserMessageId: "second-message",
++        })).rejects.toThrow("Invalid request");
++        expect(fork).not.toHaveBeenCalled();
++        expect(start).not.toHaveBeenCalled();
++    });
++});
 diff --git a/src/index.ts b/src/index.ts
-index 15ad225..6c7a179 100644
+index 1975930..7065604 100644
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -13,8 +13,8 @@ import {logger} from "./Logger";
+@@ -13,7 +13,7 @@ import {logger} from "./Logger";
  import {runLoginCommand} from "./login";
  import {runCodexCli} from "./CodexCli";
  import {
 -    GOAL_CONTROL_METHOD, LEGACY_SET_SESSION_MODEL_METHOD,
--    SESSION_STEERING_METHOD,
-+    GOAL_CONTROL_METHOD, HISTORY_EDIT_METHOD, LEGACY_SET_SESSION_MODEL_METHOD,
-+    SESSION_FORK_METHOD, SESSION_STEERING_METHOD,
++    GOAL_CONTROL_METHOD, HISTORY_EDIT_METHOD, SESSION_FORK_METHOD, LEGACY_SET_SESSION_MODEL_METHOD,
+     SESSION_STEERING_METHOD,
  } from "./AcpExtensions";
- 
- const emptyExtensionParamsParser = z.preprocess(
-@@ -44,6 +44,15 @@ const goalControlParamsParser = z.discriminatedUnion("action", [
-     }).passthrough(),
- ]);
+ import {ASYNC_TASK_STOP_METHOD} from "./async-tasks/AsyncTaskExtension";
+@@ -50,6 +50,15 @@ const asyncTaskStopParamsParser = z.object({
+     asyncTaskId: z.string().trim().min(1),
+ }).passthrough();
  
 +const historyEditParamsParser = z.object({
 +    sessionId: z.string(),
@@ -355,12 +463,12 @@ index 15ad225..6c7a179 100644
  if (process.argv.includes("--version")) {
      console.log(`${packageJson.name} ${packageJson.version}`);
      process.exit(0);
-@@ -160,6 +169,8 @@ function startAcpServer() {
+@@ -166,6 +175,8 @@ function startAcpServer() {
+         .onRequest("authentication/status", emptyExtensionParamsParser, (ctx) => getAgent().extMethod("authentication/status", ctx.params))
          .onRequest("authentication/logout", emptyExtensionParamsParser, (ctx) => getAgent().extMethod("authentication/logout", ctx.params))
          .onRequest(LEGACY_SET_SESSION_MODEL_METHOD, legacySetSessionModelParamsParser, (ctx) => getAgent().extMethod(LEGACY_SET_SESSION_MODEL_METHOD, ctx.params))
-         .onRequest(SESSION_STEERING_METHOD, sessionSteerParamsParser, (ctx) => getAgent().extMethod(SESSION_STEERING_METHOD, ctx.params))
 +        .onRequest(HISTORY_EDIT_METHOD, historyEditParamsParser, (ctx) => getAgent().extMethod(HISTORY_EDIT_METHOD, ctx.params))
 +        .onRequest(SESSION_FORK_METHOD, sessionForkParamsParser, (ctx) => getAgent().extMethod(SESSION_FORK_METHOD, ctx.params))
+         .onRequest(SESSION_STEERING_METHOD, sessionSteerParamsParser, (ctx) => getAgent().extMethod(SESSION_STEERING_METHOD, ctx.params))
+         .onRequest(ASYNC_TASK_STOP_METHOD, asyncTaskStopParamsParser, (ctx) => getAgent().extMethod(ASYNC_TASK_STOP_METHOD, ctx.params))
          .onRequest(GOAL_CONTROL_METHOD, goalControlParamsParser, (ctx) => getAgent().extMethod(GOAL_CONTROL_METHOD, ctx.params))
-         .connect(acpJsonStream);
- }

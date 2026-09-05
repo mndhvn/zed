@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-codex_acp_version="1.6.2"
-codex_acp_commit="9780d314d34616b476b1ae451ad31089b3dce49a"
+codex_acp_version="1.10.0"
+codex_acp_commit="061f9a4a2e463a220d7a3ab2ae5e9732837085ef"
 workspace_root=$(git rev-parse --show-toplevel)
 target_dir="${CARGO_TARGET_DIR:-target}"
 architecture=$(uname -m)
