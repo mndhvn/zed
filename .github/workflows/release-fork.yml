@@ -1,0 +1,44 @@
+name: release-fork
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+on:
+  push:
+    tags:
+    - v*-fork*
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  bundle_mac_aarch64:
+    if: github.repository_owner == 'mndhvn'
+    runs-on: macos-latest
+    env:
+      ZED_UPDATE_EXPLANATION: This is a custom fork of Zed. Updates are not automatic; rebuild from source to update.
+    steps:
+    - name: checkout_repo
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        clean: false
+    - name: setup_node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: '24'
+        check-latest: true
+        package-manager-cache: false
+    - name: setup_rust
+      run: |
+        rustup show
+        rustup target add aarch64-apple-darwin
+    - name: bundle_mac
+      run: ./script/bundle-mac aarch64-apple-darwin
+    - name: upload_artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: Zed-aarch64.dmg
+        path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+        if-no-files-found: error
+    - name: create_release
+      run: gh release create "$GITHUB_REF_NAME" target/aarch64-apple-darwin/release/Zed-aarch64.dmg --title "$GITHUB_REF_NAME" --notes "Custom fork build of official Zed v1.18.1 with local modifications. Unsigned build - right-click and Open on first launch."
+      env:
+        GH_TOKEN: ${{ github.token }}
