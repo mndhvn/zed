@@ -392,12 +392,10 @@ fn can_merge_message_chunks(
     }
 }
 
-fn client_user_message_id_from_meta(meta: Option<&acp::Meta>) -> Option<ClientUserMessageId> {
-    meta.and_then(|meta| meta.get("codex"))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|codex| codex.get("clientUserMessageId"))
-        .and_then(serde_json::Value::as_str)
-        .map(|id| ClientUserMessageId::from_agent(id.to_owned()))
+fn client_user_message_id_from_update(
+    message_id: Option<&acp::MessageId>,
+) -> Option<ClientUserMessageId> {
+    message_id.map(|message_id| ClientUserMessageId::from_agent(message_id.to_string()))
 }
 
 #[derive(Debug)]
@@ -2332,7 +2330,8 @@ impl AcpThread {
                 | AcpThreadEvent::AvailableCommandsUpdated(_)
                 | AcpThreadEvent::ModeUpdated(_)
                 | AcpThreadEvent::ConfigOptionsUpdated(_)
-                | AcpThreadEvent::WorkingDirectoriesUpdated => {}
+                | AcpThreadEvent::WorkingDirectoriesUpdated
+                | AcpThreadEvent::SessionIdChanged { .. } => {}
             });
 
         let git_store = project.read(cx).git_store().clone();
@@ -2611,10 +2610,9 @@ impl AcpThread {
             acp::SessionUpdate::UserMessageChunk(acp::ContentChunk {
                 content,
                 message_id,
-                meta,
                 ..
             }) => {
-                let client_id = client_user_message_id_from_meta(meta.as_ref());
+                let client_id = client_user_message_id_from_update(message_id.as_ref());
                 // We optimistically add the full user prompt before calling `prompt`.
                 // Some ACP servers echo user chunks back over updates. Skip echoed
                 // chunks only when they match the local optimistic message.
@@ -5714,6 +5712,13 @@ mod tests {
                     .as_deref(),
                 Some("msg_user_1")
             );
+            assert_eq!(
+                first_message
+                    .client_id
+                    .as_ref()
+                    .map(ClientUserMessageId::as_str),
+                Some("msg_user_1")
+            );
 
             let AgentThreadEntry::UserMessage(second_message) = &thread.entries[1] else {
                 panic!("expected second entry to be a user message")
@@ -5725,6 +5730,13 @@ mod tests {
                     .as_ref()
                     .map(ToString::to_string)
                     .as_deref(),
+                Some("msg_user_2")
+            );
+            assert_eq!(
+                second_message
+                    .client_id
+                    .as_ref()
+                    .map(ClientUserMessageId::as_str),
                 Some("msg_user_2")
             );
 
@@ -5740,48 +5752,12 @@ mod tests {
                     .as_deref(),
                 Some("msg_user_3")
             );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_user_message_chunk_accepts_codex_client_message_id(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
-            })
-            .await
-            .unwrap();
-
-        thread.update(cx, |thread, cx| {
-            thread
-                .handle_session_update(
-                    acp::SessionUpdate::UserMessageChunk(
-                        acp::ContentChunk::new("Historical prompt".into())
-                            .message_id("protocol-message")
-                            .meta(acp::Meta::from_iter([(
-                                "codex".into(),
-                                json!({"clientUserMessageId": "codex-user-item"}),
-                            )])),
-                    ),
-                    cx,
-                )
-                .unwrap();
-        });
-
-        thread.read_with(cx, |thread, _cx| {
-            let AgentThreadEntry::UserMessage(message) = &thread.entries()[0] else {
-                panic!("expected a user message")
-            };
             assert_eq!(
-                message.client_id.as_ref().map(ClientUserMessageId::as_str),
-                Some("codex-user-item")
+                third_message
+                    .client_id
+                    .as_ref()
+                    .map(ClientUserMessageId::as_str),
+                Some("msg_user_3")
             );
         });
     }
@@ -5844,6 +5820,13 @@ mod tests {
                     .as_ref()
                     .map(ToString::to_string)
                     .as_deref(),
+                Some("agent_user_chunk")
+            );
+            assert_eq!(
+                agent_message
+                    .client_id
+                    .as_ref()
+                    .map(ClientUserMessageId::as_str),
                 Some("agent_user_chunk")
             );
         });
@@ -6152,6 +6135,65 @@ mod tests {
             assert_eq!(message.protocol_id, None);
             assert_eq!(message.client_id, None);
             assert!(message.is_optimistic);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_echoed_user_message_records_protocol_id_for_history_editing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(
+            FakeAgentConnection::new()
+                .without_truncate_support()
+                .on_user_message(|request, thread, mut cx| {
+                    async move {
+                        let prompt = request.prompt.first().cloned().unwrap_or_else(|| "".into());
+                        thread.update(&mut cx, |thread, cx| {
+                            thread.handle_session_update(
+                                acp::SessionUpdate::UserMessageChunk(
+                                    acp::ContentChunk::new(prompt)
+                                        .message_id("protocol-user-message"),
+                                ),
+                                cx,
+                            )
+                        })??;
+                        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                    }
+                    .boxed_local()
+                }),
+        );
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Hello from Zed!", cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, _cx| {
+            let Some(AgentThreadEntry::UserMessage(message)) = thread.entries.first() else {
+                panic!("expected optimistic user message");
+            };
+            assert_eq!(
+                message
+                    .protocol_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("protocol-user-message")
+            );
+            assert_eq!(
+                message.client_id.as_ref().map(ClientUserMessageId::as_str),
+                Some("protocol-user-message")
+            );
         });
     }
 

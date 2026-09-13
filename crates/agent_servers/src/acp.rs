@@ -1,16 +1,14 @@
 use acp_thread::{
-    AgentConnection, AgentSessionClientUserMessageIds, AgentSessionInfo, AgentSessionList,
-    AgentSessionListRequest, AgentSessionListResponse, AgentSessionTruncate,
-    AgentSessionTruncateResponse, ClientUserMessageId, ElicitationStore,
+    AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
+    AgentSessionListResponse, AgentSessionTruncate, AgentSessionTruncateResponse,
+    ClientUserMessageId, ElicitationStore,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{self as acp, ErrorCode},
 };
-use agent_client_protocol::{
-    Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder, UntypedMessage,
-};
+use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
@@ -405,7 +403,7 @@ pub struct AcpConnection {
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
-    history_edit_method: Option<Arc<str>>,
+    supports_history_editing: bool,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
@@ -783,21 +781,22 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
         .meta(meta)
 }
 
-fn history_edit_method(meta: Option<&acp::Meta>) -> Option<Arc<str>> {
-    let history_editing = meta?
-        .get("codex")?
-        .as_object()?
-        .get("historyEditing")?
-        .as_object()?;
-    if history_editing
-        .get("clientUserMessageIds")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
-        return None;
+fn supports_air_history_editing(
+    agent_capabilities: &acp::AgentCapabilities,
+    meta: Option<&acp::Meta>,
+) -> bool {
+    let session_capabilities = &agent_capabilities.session_capabilities;
+    if session_capabilities.fork.is_none() || session_capabilities.delete.is_none() {
+        return false;
     }
-    let method = history_editing.get("method")?.as_str()?;
-    method.starts_with('_').then(|| Arc::from(method))
+
+    meta.and_then(|meta| meta.get("jetbrains"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|jetbrains| jetbrains.get("air"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|air| air.get("version"))
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version >= 1)
 }
 
 impl AcpConnection {
@@ -1028,7 +1027,8 @@ impl AcpConnection {
         });
 
         let agent_info = response.agent_info;
-        let history_edit_method = history_edit_method(response.meta.as_ref());
+        let supports_history_editing =
+            supports_air_history_editing(&response.agent_capabilities, response.meta.as_ref());
         let telemetry_id = agent_info
             .as_ref()
             // Use the one the agent provides if we have one
@@ -1095,7 +1095,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
             agent_capabilities: response.agent_capabilities,
-            history_edit_method,
+            supports_history_editing,
             request_elicitations,
             defaults,
             session_list,
@@ -1138,7 +1138,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
-            history_edit_method: None,
+            supports_history_editing: false,
             request_elicitations,
             defaults,
             child: None,
@@ -1623,77 +1623,152 @@ fn send_prompt(
     })
 }
 
-struct AcpClientUserMessageIds {
-    connection: ConnectionTo<Agent>,
-    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+fn air_fork_meta(message_id: &acp::MessageId) -> acp::Meta {
+    acp::Meta::from_iter([(
+        "jetbrains".into(),
+        serde_json::json!({
+            "air": {
+                "fork": {
+                    "version": 1,
+                    "messageId": message_id.to_string(),
+                    "messageOccurrence": 1,
+                }
+            }
+        }),
+    )])
 }
 
-impl AgentSessionClientUserMessageIds for AcpClientUserMessageIds {
-    fn prompt(
-        &self,
-        client_user_message_id: ClientUserMessageId,
-        mut params: acp::PromptRequest,
-        cx: &mut App,
-    ) -> Task<Result<acp::PromptResponse>> {
-        let meta = params.meta.get_or_insert_default();
-        let codex = meta.entry("codex").or_insert_with(|| serde_json::json!({}));
-        if !codex.is_object() {
-            *codex = serde_json::json!({});
-        }
-        codex.as_object_mut().unwrap().insert(
-            "clientUserMessageId".into(),
-            client_user_message_id.as_str().into(),
-        );
-
-        send_prompt(self.connection.clone(), self.sessions.clone(), params, cx)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ForkEditResponse {
-    session_id: acp::SessionId,
-}
-
-struct AcpSessionForkEdit {
+struct AcpSessionHistoryEditor {
     connection: ConnectionTo<Agent>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_id: acp::SessionId,
-    method: Arc<str>,
+    thread: WeakEntity<AcpThread>,
+    supports_additional_directories: bool,
 }
 
-impl AgentSessionTruncate for AcpSessionForkEdit {
+impl AgentSessionTruncate for AcpSessionHistoryEditor {
     fn run(
         &self,
         client_user_message_id: ClientUserMessageId,
         cx: &mut App,
     ) -> Task<Result<AgentSessionTruncateResponse>> {
-        let request = match UntypedMessage::new(
-            self.method.as_ref(),
-            serde_json::json!({
-            "sessionId": self.session_id,
-            "clientUserMessageId": client_user_message_id.as_str(),
-            }),
-        ) {
-            Ok(request) => request,
-            Err(error) => return Task::ready(Err(error.into())),
+        let Some(thread) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!(
+                "ACP session disappeared while editing history"
+            )));
         };
+
+        let edit_context = thread.read_with(cx, |thread, cx| {
+            let work_dirs = thread
+                .work_dirs()
+                .context("ACP session has no working directory")?;
+            let directories = session_directories_from_work_dirs(
+                work_dirs,
+                self.supports_additional_directories,
+            )?;
+            let mcp_servers = mcp_servers_for_project(thread.project(), cx);
+            let target_index = thread
+                .entries()
+                .iter()
+                .position(|entry| {
+                    entry.user_message().is_some_and(|message| {
+                        message.client_id.as_ref() == Some(&client_user_message_id)
+                    })
+                })
+                .context("user message disappeared while editing history")?;
+            let preceding_message_id = thread.entries()[..target_index]
+                .iter()
+                .rev()
+                .filter_map(|entry| entry.user_message())
+                .next()
+                .map(|message| {
+                    message
+                        .protocol_id
+                        .clone()
+                        .context("previous user message has no ACP message ID")
+                })
+                .transpose()?;
+
+            anyhow::Ok((directories, mcp_servers, preceding_message_id))
+        });
+        let (directories, mcp_servers, preceding_message_id) = match edit_context {
+            Ok(edit_context) => edit_context,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
         let connection = self.connection.clone();
         let sessions = self.sessions.clone();
         let old_session_id = self.session_id.clone();
 
         cx.foreground_executor().spawn(async move {
-            let response = connection.send_request(request).block_task().await?;
-            let response: ForkEditResponse = serde_json::from_value(response)?;
+            let SessionDirectories {
+                cwd,
+                additional_directories,
+            } = directories;
+            let (new_session_id, modes, config_options) =
+                if let Some(preceding_message_id) = preceding_message_id {
+                    let response = connection
+                        .send_request(
+                            acp::ForkSessionRequest::new(old_session_id.clone(), cwd)
+                                .additional_directories(additional_directories)
+                                .mcp_servers(mcp_servers)
+                                .meta(air_fork_meta(&preceding_message_id)),
+                        )
+                        .block_task()
+                        .await
+                        .map_err(map_acp_error)?;
+                    (response.session_id, response.modes, response.config_options)
+                } else {
+                    let response = connection
+                        .send_request(
+                            acp::NewSessionRequest::new(cwd)
+                                .additional_directories(additional_directories)
+                                .mcp_servers(mcp_servers),
+                        )
+                        .block_task()
+                        .await
+                        .map_err(map_acp_error)?;
+                    (response.session_id, response.modes, response.config_options)
+                };
 
-            let mut sessions = sessions.borrow_mut();
-            let session = sessions
-                .remove(&old_session_id)
-                .context("ACP session disappeared while forking edited history")?;
-            sessions.insert(response.session_id.clone(), session);
+            if new_session_id == old_session_id {
+                anyhow::bail!("ACP agent reused the source session ID while editing history");
+            }
+
+            let (session_modes, session_config_options) = config_state(modes, config_options);
+            let session_was_moved = {
+                let mut sessions = sessions.borrow_mut();
+                if let Some(mut session) = sessions.remove(&old_session_id) {
+                    if session_modes.is_some() || session_config_options.is_some() {
+                        session.session_modes = session_modes;
+                        session.config_options = session_config_options.map(ConfigOptions::new);
+                    }
+                    sessions.insert(new_session_id.clone(), session);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if !session_was_moved {
+                connection
+                    .send_request(acp::DeleteSessionRequest::new(new_session_id))
+                    .block_task()
+                    .await
+                    .log_err();
+                anyhow::bail!("ACP session disappeared while editing history");
+            }
+
+            if let Err(error) = connection
+                .send_request(acp::DeleteSessionRequest::new(old_session_id.clone()))
+                .block_task()
+                .await
+            {
+                log::error!("Failed to archive superseded ACP session {old_session_id}: {error}");
+            }
 
             Ok(AgentSessionTruncateResponse {
-                session_id: Some(response.session_id),
+                session_id: Some(new_session_id),
             })
         })
     }
@@ -2025,18 +2100,6 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.auth.logout.is_some()
     }
 
-    fn client_user_message_ids(
-        &self,
-        _cx: &App,
-    ) -> Option<Rc<dyn AgentSessionClientUserMessageIds>> {
-        self.history_edit_method.as_ref().map(|_| {
-            Rc::new(AcpClientUserMessageIds {
-                connection: self.connection.clone(),
-                sessions: self.sessions.clone(),
-            }) as _
-        })
-    }
-
     fn logout(&self, cx: &mut App) -> Task<Result<()>> {
         if !self.supports_logout() {
             return Task::ready(Err(anyhow!("Logout is not supported by this agent.")));
@@ -2076,14 +2139,17 @@ impl AgentConnection for AcpConnection {
         session_id: &acp::SessionId,
         _cx: &App,
     ) -> Option<Rc<dyn AgentSessionTruncate>> {
-        self.history_edit_method.as_ref().map(|method| {
-            Rc::new(AcpSessionForkEdit {
-                connection: self.connection.clone(),
-                sessions: self.sessions.clone(),
-                session_id: session_id.clone(),
-                method: method.clone(),
-            }) as _
-        })
+        if !self.supports_history_editing {
+            return None;
+        }
+        let thread = self.sessions.borrow().get(session_id)?.thread.clone();
+        Some(Rc::new(AcpSessionHistoryEditor {
+            connection: self.connection.clone(),
+            sessions: self.sessions.clone(),
+            session_id: session_id.clone(),
+            thread,
+            supports_additional_directories: self.supports_session_additional_directories(),
+        }))
     }
 
     fn session_modes(
@@ -2776,46 +2842,357 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_history_edit_capability() {
+    fn recognizes_standard_air_history_editing_capabilities() {
+        let capabilities = acp::AgentCapabilities::default().session_capabilities(
+            acp::SessionCapabilities::default()
+                .fork(acp::SessionForkCapabilities::new())
+                .delete(acp::SessionDeleteCapabilities::new()),
+        );
         let meta = acp::Meta::from_iter([(
-            "codex".into(),
+            "jetbrains".into(),
             serde_json::json!({
-                "historyEditing": {
-                    "clientUserMessageIds": true,
-                    "method": "_session/fork_edit"
+                "air": {
+                    "version": 1
                 }
             }),
         )]);
 
-        assert_eq!(
-            history_edit_method(Some(&meta)).as_deref(),
-            Some("_session/fork_edit")
-        );
+        assert!(supports_air_history_editing(&capabilities, Some(&meta)));
     }
 
     #[test]
-    fn rejects_unadvertised_or_non_extension_history_edit_methods() {
-        let disabled = acp::Meta::from_iter([(
-            "codex".into(),
+    fn rejects_incomplete_air_history_editing_capabilities() {
+        let fork_only = acp::AgentCapabilities::default().session_capabilities(
+            acp::SessionCapabilities::default().fork(acp::SessionForkCapabilities::new()),
+        );
+        let complete = acp::AgentCapabilities::default().session_capabilities(
+            acp::SessionCapabilities::default()
+                .fork(acp::SessionForkCapabilities::new())
+                .delete(acp::SessionDeleteCapabilities::new()),
+        );
+        let meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
             serde_json::json!({
-                "historyEditing": {
-                    "clientUserMessageIds": false,
-                    "method": "_session/fork_edit"
+                "air": {
+                    "version": 1
                 }
             }),
         )]);
-        let invalid_method = acp::Meta::from_iter([(
-            "codex".into(),
-            serde_json::json!({
-                "historyEditing": {
-                    "clientUserMessageIds": true,
-                    "method": "session/fork_edit"
-                }
-            }),
+        let unrelated_meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            serde_json::json!({"air": {"capabilities": []}}),
         )]);
 
-        assert!(history_edit_method(Some(&disabled)).is_none());
-        assert!(history_edit_method(Some(&invalid_method)).is_none());
+        assert!(!supports_air_history_editing(&fork_only, Some(&meta)));
+        assert!(!supports_air_history_editing(
+            &complete,
+            Some(&unrelated_meta)
+        ));
+        assert!(!supports_air_history_editing(&complete, None));
+    }
+
+    #[test]
+    fn air_fork_metadata_uses_the_previous_message_id() {
+        let meta = air_fork_meta(&acp::MessageId::new("previous-user-message"));
+
+        assert_eq!(
+            meta.get("jetbrains")
+                .and_then(|jetbrains| jetbrains.get("air"))
+                .and_then(|air| air.get("fork")),
+            Some(&serde_json::json!({
+                "version": 1,
+                "messageId": "previous-user-message",
+                "messageOccurrence": 1,
+            }))
+        );
+    }
+
+    #[derive(Default)]
+    struct HistoryEditRequests {
+        forks: Mutex<Vec<acp::ForkSessionRequest>>,
+        new_sessions: Mutex<Vec<acp::NewSessionRequest>>,
+        deletions: Mutex<Vec<acp::SessionId>>,
+    }
+
+    async fn history_edit_test_connection(
+        requests: Arc<HistoryEditRequests>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Rc<AcpConnection>, Entity<AcpThread>, acp::SessionId) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        cx.background_spawn(
+            Agent
+                .builder()
+                .name("history-edit-test-agent")
+                .on_receive_request(
+                    {
+                        let requests = requests.clone();
+                        async move |request: acp::ForkSessionRequest, responder, _cx| {
+                            requests
+                                .forks
+                                .lock()
+                                .expect("fork requests lock should not be poisoned")
+                                .push(request);
+                            responder.respond(acp::ForkSessionResponse::new("forked-session"))
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let requests = requests.clone();
+                        async move |request: acp::NewSessionRequest, responder, _cx| {
+                            requests
+                                .new_sessions
+                                .lock()
+                                .expect("new session requests lock should not be poisoned")
+                                .push(request);
+                            responder.respond(acp::NewSessionResponse::new("new-session"))
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let requests = requests.clone();
+                        async move |request: acp::DeleteSessionRequest, responder, _cx| {
+                            requests
+                                .deletions
+                                .lock()
+                                .expect("deletion requests lock should not be poisoned")
+                                .push(request.session_id);
+                            responder.respond(acp::DeleteSessionResponse::default())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport),
+        )
+        .detach();
+
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        cx.background_spawn(
+            Client
+                .builder()
+                .name("history-edit-test-client")
+                .connect_with(
+                    client_transport,
+                    move |connection: ConnectionTo<Agent>| async move {
+                        connection_tx.send(connection).ok();
+                        futures::future::pending::<Result<(), acp::Error>>().await
+                    },
+                ),
+        )
+        .detach();
+        let protocol_connection = connection_rx
+            .await
+            .expect("failed to receive ACP connection");
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "workspace": {}, "extra": {} }))
+            .await;
+        let project = project::Project::test(fs, [std::path::Path::new("/workspace")], cx).await;
+        let sessions = Rc::new(RefCell::new(HashMap::default()));
+        let connection = cx.update(|cx| {
+            let request_elicitations = cx.new(|_| ElicitationStore::default());
+            let capabilities = acp::AgentCapabilities::default().session_capabilities(
+                acp::SessionCapabilities::default()
+                    .fork(acp::SessionForkCapabilities::new())
+                    .delete(acp::SessionDeleteCapabilities::new())
+                    .additional_directories(acp::SessionAdditionalDirectoriesCapabilities::new()),
+            );
+            let mut connection = AcpConnection::new_for_test(
+                protocol_connection,
+                sessions.clone(),
+                capabilities,
+                request_elicitations,
+                WeakEntity::new_invalid(),
+                Task::ready(()),
+                Task::ready(()),
+                cx,
+            );
+            connection.supports_history_editing = true;
+            Rc::new(connection)
+        });
+
+        let source_session_id = acp::SessionId::new("source-session");
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let thread = cx.new(|cx| {
+            AcpThread::new(
+                None,
+                None,
+                Some(PathList::new(&[
+                    PathBuf::from("/workspace"),
+                    PathBuf::from("/extra"),
+                ])),
+                connection.clone(),
+                project,
+                action_log,
+                source_session_id.clone(),
+                watch::Receiver::constant(acp::PromptCapabilities::default()),
+                cx,
+            )
+        });
+        sessions.borrow_mut().insert(
+            source_session_id.clone(),
+            AcpSession {
+                thread: thread.downgrade(),
+                suppress_abort_err: false,
+                session_modes: None,
+                config_options: None,
+                ref_count: 1,
+            },
+        );
+
+        (connection, thread, source_session_id)
+    }
+
+    #[gpui::test]
+    async fn history_edit_forks_after_previous_message_and_archives_source(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let requests = Arc::new(HistoryEditRequests::default());
+        let (connection, thread, source_session_id) =
+            history_edit_test_connection(requests.clone(), cx).await;
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("First prompt".into()).message_id("first-message"),
+                    ),
+                    cx,
+                )
+                .expect("first user message should be accepted");
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("Second prompt".into()).message_id("second-message"),
+                    ),
+                    cx,
+                )
+                .expect("second user message should be accepted");
+        });
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.rewind(ClientUserMessageId::from_agent("second-message"), cx)
+            })
+            .await
+            .expect("history edit should succeed");
+
+        let fork_requests = requests
+            .forks
+            .lock()
+            .expect("fork requests lock should not be poisoned");
+        assert_eq!(fork_requests.len(), 1);
+        let fork_request = &fork_requests[0];
+        assert_eq!(fork_request.session_id, source_session_id);
+        assert_eq!(fork_request.cwd, PathBuf::from("/workspace"));
+        assert_eq!(
+            fork_request.additional_directories,
+            vec![PathBuf::from("/extra")]
+        );
+        assert_eq!(
+            fork_request
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("jetbrains"))
+                .and_then(|jetbrains| jetbrains.get("air"))
+                .and_then(|air| air.get("fork"))
+                .and_then(|fork| fork.get("messageId"))
+                .and_then(serde_json::Value::as_str),
+            Some("first-message")
+        );
+        drop(fork_requests);
+
+        assert!(
+            requests
+                .new_sessions
+                .lock()
+                .expect("new session requests lock should not be poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            *requests
+                .deletions
+                .lock()
+                .expect("deletion requests lock should not be poisoned"),
+            vec![source_session_id]
+        );
+        let active_session_id = thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        assert_eq!(active_session_id, acp::SessionId::new("forked-session"));
+        assert!(
+            connection
+                .sessions
+                .borrow()
+                .contains_key(&active_session_id)
+        );
+    }
+
+    #[gpui::test]
+    async fn editing_first_message_starts_fresh_session_and_archives_source(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let requests = Arc::new(HistoryEditRequests::default());
+        let (connection, thread, source_session_id) =
+            history_edit_test_connection(requests.clone(), cx).await;
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("First prompt".into()).message_id("first-message"),
+                    ),
+                    cx,
+                )
+                .expect("first user message should be accepted");
+        });
+        thread
+            .update(cx, |thread, cx| {
+                thread.rewind(ClientUserMessageId::from_agent("first-message"), cx)
+            })
+            .await
+            .expect("history edit should succeed");
+
+        assert!(
+            requests
+                .forks
+                .lock()
+                .expect("fork requests lock should not be poisoned")
+                .is_empty()
+        );
+        let new_session_requests = requests
+            .new_sessions
+            .lock()
+            .expect("new session requests lock should not be poisoned");
+        assert_eq!(new_session_requests.len(), 1);
+        assert_eq!(new_session_requests[0].cwd, PathBuf::from("/workspace"));
+        assert_eq!(
+            new_session_requests[0].additional_directories,
+            vec![PathBuf::from("/extra")]
+        );
+        drop(new_session_requests);
+
+        assert_eq!(
+            *requests
+                .deletions
+                .lock()
+                .expect("deletion requests lock should not be poisoned"),
+            vec![source_session_id]
+        );
+        let active_session_id = thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        assert_eq!(active_session_id, acp::SessionId::new("new-session"));
+        assert!(
+            connection
+                .sessions
+                .borrow()
+                .contains_key(&active_session_id)
+        );
     }
 
     #[gpui::test]
