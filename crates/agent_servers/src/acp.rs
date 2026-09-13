@@ -1,7 +1,8 @@
 use acp_thread::{
-    AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, AgentSessionTruncate, AgentSessionTruncateResponse,
-    ClientUserMessageId, ElicitationStore,
+    AcpThread, AgentConnection, AgentSessionClientUserMessageIds, AgentSessionInfo,
+    AgentSessionList, AgentSessionListRequest, AgentSessionListResponse, AgentSessionTruncate,
+    AgentSessionTruncateResponse, AgentThreadEntry, AssistantMessageChunk, AuthRequired,
+    ClientUserMessageId, ElicitationStore, LoadError, TerminalProviderEvent,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -37,7 +38,6 @@ use util::process::Child;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
 
-use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
@@ -1638,6 +1638,41 @@ fn air_fork_meta(message_id: &acp::MessageId) -> acp::Meta {
     )])
 }
 
+fn entry_protocol_message_id(entry: &AgentThreadEntry) -> Option<acp::MessageId> {
+    match entry {
+        AgentThreadEntry::UserMessage(message) => message.protocol_id.clone(),
+        AgentThreadEntry::AssistantMessage(message) => {
+            message.chunks.iter().rev().find_map(|chunk| match chunk {
+                AssistantMessageChunk::Message { id, .. }
+                | AssistantMessageChunk::Thought { id, .. } => id.clone(),
+            })
+        }
+        AgentThreadEntry::ToolCall(_)
+        | AgentThreadEntry::Elicitation(_)
+        | AgentThreadEntry::CompletedPlan(_)
+        | AgentThreadEntry::ContextCompaction(_) => None,
+    }
+}
+
+struct AcpHistoryEditingClientUserMessageIds {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+}
+
+impl AgentSessionClientUserMessageIds for AcpHistoryEditingClientUserMessageIds {
+    fn prompt(
+        &self,
+        _client_user_message_id: ClientUserMessageId,
+        params: acp::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        // AIR identifies the fork point with a server-generated message ID. The
+        // client-generated ID only gives Zed a stable handle for a live prompt,
+        // whose echoed user-message update may not include a protocol ID.
+        send_prompt(self.connection.clone(), self.sessions.clone(), params, cx)
+    }
+}
+
 struct AcpSessionHistoryEditor {
     connection: ConnectionTo<Agent>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
@@ -1676,18 +1711,21 @@ impl AgentSessionTruncate for AcpSessionHistoryEditor {
                     })
                 })
                 .context("user message disappeared while editing history")?;
-            let preceding_message_id = thread.entries()[..target_index]
+            let entries_before_target = &thread.entries()[..target_index];
+            let has_preceding_user_message = entries_before_target
                 .iter()
-                .rev()
-                .filter_map(|entry| entry.user_message())
-                .next()
-                .map(|message| {
-                    message
-                        .protocol_id
-                        .clone()
-                        .context("previous user message has no ACP message ID")
+                .any(|entry| entry.user_message().is_some());
+            let preceding_message_id = has_preceding_user_message
+                .then(|| {
+                    entries_before_target
+                        .iter()
+                        .rev()
+                        .find_map(entry_protocol_message_id)
                 })
-                .transpose()?;
+                .flatten();
+            if has_preceding_user_message && preceding_message_id.is_none() {
+                anyhow::bail!("previous turn has no ACP message ID");
+            }
 
             anyhow::Ok((directories, mcp_servers, preceding_message_id))
         });
@@ -2111,6 +2149,18 @@ impl AgentConnection for AcpConnection {
                 .block_task()
                 .await?;
             Ok(())
+        })
+    }
+
+    fn client_user_message_ids(
+        &self,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionClientUserMessageIds>> {
+        self.supports_history_editing.then(|| {
+            Rc::new(AcpHistoryEditingClientUserMessageIds {
+                connection: self.connection.clone(),
+                sessions: self.sessions.clone(),
+            }) as _
         })
     }
 
@@ -2970,6 +3020,12 @@ mod tests {
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
+                .on_receive_request(
+                    async move |_request: acp::PromptRequest, responder, _cx| {
+                        responder.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
                 .connect_to(agent_transport),
         )
         .detach();
@@ -3049,6 +3105,74 @@ mod tests {
         );
 
         (connection, thread, source_session_id)
+    }
+
+    #[gpui::test]
+    async fn live_history_edit_uses_preceding_agent_message_id(cx: &mut gpui::TestAppContext) {
+        let requests = Arc::new(HistoryEditRequests::default());
+        let (_connection, thread, _source_session_id) =
+            history_edit_test_connection(requests.clone(), cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("First prompt", cx))
+            .await
+            .expect("first prompt should succeed");
+        thread.read_with(cx, |thread, _cx| {
+            let first_message = thread
+                .entries()
+                .first()
+                .and_then(|entry| entry.user_message())
+                .expect("first entry should be a user message");
+            assert!(
+                first_message.client_id.is_some(),
+                "first live user message should have a client ID"
+            );
+        });
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("First response".into())
+                            .message_id("first-agent-message"),
+                    ),
+                    cx,
+                )
+                .expect("agent response should be accepted");
+        });
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Second prompt", cx))
+            .await
+            .expect("second prompt should succeed");
+
+        let second_client_id = thread.read_with(cx, |thread, _cx| {
+            thread
+                .entries()
+                .last()
+                .and_then(|entry| entry.user_message())
+                .and_then(|message| message.client_id.clone())
+                .expect("live user message should have a client ID")
+        });
+        thread
+            .update(cx, |thread, cx| thread.rewind(second_client_id, cx))
+            .await
+            .expect("history edit should succeed");
+
+        let fork_requests = requests
+            .forks
+            .lock()
+            .expect("fork requests lock should not be poisoned");
+        assert_eq!(fork_requests.len(), 1);
+        assert_eq!(
+            fork_requests[0]
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("jetbrains"))
+                .and_then(|jetbrains| jetbrains.get("air"))
+                .and_then(|air| air.get("fork"))
+                .and_then(|fork| fork.get("messageId"))
+                .and_then(serde_json::Value::as_str),
+            Some("first-agent-message")
+        );
     }
 
     #[gpui::test]
