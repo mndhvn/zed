@@ -39,6 +39,8 @@ jobs:
         path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
         if-no-files-found: error
     - name: create_release
-      run: gh release create "$GITHUB_REF_NAME" target/aarch64-apple-darwin/release/Zed-aarch64.dmg --title "$GITHUB_REF_NAME" --notes "Custom fork build of official Zed v1.18.1 with local modifications. Unsigned build - right-click and Open on first launch."
+      run: |
+        upstream_tag="${GITHUB_REF_NAME%%-fork*}"
+        gh release create "$GITHUB_REF_NAME" target/aarch64-apple-darwin/release/Zed-aarch64.dmg --title "$GITHUB_REF_NAME" --notes "Custom fork build based on official Zed ${upstream_tag}. Unsigned build - right-click and Open on first launch."
       env:
         GH_TOKEN: ${{ github.token }}
