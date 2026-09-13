@@ -3044,7 +3044,7 @@ mod tests {
                 suppress_abort_err: false,
                 session_modes: None,
                 config_options: None,
-                ref_count: 1,
+                _release_subscription: Subscription::new(|| {}),
             },
         );
 
