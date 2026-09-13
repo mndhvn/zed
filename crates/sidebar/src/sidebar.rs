@@ -5734,7 +5734,7 @@ impl Sidebar {
         };
         let thread_id = thread.metadata.thread_id;
         let title = thread.metadata.display_title();
-        self.start_renaming_thread(ix, thread_id, title, window, cx);
+        self.start_renaming_entry(ix, RenameTarget::Thread(thread_id), title, window, cx);
     }
 
     fn rename_selected_thread(
